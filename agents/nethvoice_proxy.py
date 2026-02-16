@@ -52,7 +52,45 @@ class NethVoiceProxyTester:
         self.logger.error(f"Cannot access FreePBX container '{self.container}': {err}")
         return False
 
-    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name=None):
+    def detect_outbound_proxy(self):
+        """Auto-detect the outbound proxy from existing FreePBX/pjsip config."""
+        self.logger.info("Detecting outbound proxy from existing config...")
+        
+        # Method 1: Check existing trunk registrations for outbound_proxy
+        out, _, code = self._exec("grep -r 'outbound_proxy' /etc/asterisk/pjsip*.conf 2>/dev/null | head -5")
+        if code == 0 and out.strip():
+            for line in out.split("\n"):
+                if "outbound_proxy" in line and "=" in line:
+                    val = line.split("=", 1)[1].strip()
+                    if val and val != "(vuoto)" and "sip:" in val:
+                        self.logger.info(f"Found outbound_proxy in config: {val}")
+                        return val
+        
+        # Method 2: Check pjsip show endpoint on existing trunks to find proxy
+        reg_out, _, _ = self._exec("asterisk -rx 'pjsip show registrations'")
+        if reg_out:
+            for line in reg_out.split("\n"):
+                if "Registered" in line and "_trunkchk_" not in line:
+                    trunk_id = line.split("/")[0].strip()
+                    if trunk_id:
+                        ep_out, _, _ = self._exec(f"asterisk -rx 'pjsip show endpoint {trunk_id}'")
+                        if ep_out and "outbound_proxy" in ep_out.lower():
+                            for ep_line in ep_out.split("\n"):
+                                if "outbound_proxy" in ep_line.lower() and "sip:" in ep_line:
+                                    val = ep_line.split(":", 1)[1].strip() if ":" in ep_line else ""
+                                    if val.startswith("sip:"):
+                                        self.logger.info(f"Found proxy from existing trunk: {val}")
+                                        return val
+        
+        # Method 3: Check transport config for external_signaling_address
+        trans_out, _, _ = self._exec("asterisk -rx 'pjsip show transports'")
+        if trans_out:
+            self.logger.info(f"Transport info: {trans_out[:300]}")
+        
+        self.logger.info("No outbound proxy detected — Asterisk uses system-level routing")
+        return None
+
+    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name=None, outbound_proxy=None):
         """Write temporary pjsip config files for the trunk."""
         self.trunk_name = f"{self.TRUNK_PREFIX}{trunk_name or 'test'}"
         safe_name = self.trunk_name
@@ -78,12 +116,14 @@ qualify_frequency=60
 """
 
         # -- Registration section --
+        reg_proxy_line = f"outbound_proxy={outbound_proxy}" if outbound_proxy else ""
         reg_conf = f"""
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=registration
 transport=transport-udp
 outbound_auth={safe_name}
+{reg_proxy_line}
 server_uri=sip:{registrar}:{sip_port}
 client_uri=sip:{auth_id}@{registrar}:{sip_port}
 retry_interval=60
@@ -91,6 +131,7 @@ expiration=300
 """
 
         # -- Endpoint section (use custom context so inbound calls are answered) --
+        ep_proxy_line = f"outbound_proxy={outbound_proxy}" if outbound_proxy else ""
         endpoint_conf = f"""
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
@@ -103,6 +144,7 @@ allow=ulaw
 allow=g729
 allow=opus
 outbound_auth={safe_name}
+{ep_proxy_line}
 aors={safe_name}
 from_user={auth_id}
 from_domain={registrar}
@@ -309,7 +351,7 @@ exten => _+X.,1,Answer()
         self.logger.info("Cleanup complete")
 
     def run_full_test(self, registrar, sip_port, trunk_number, auth_id, auth_pass, 
-                      destination_number=None, trunk_name="test"):
+                      destination_number=None, trunk_name="test", outbound_proxy=None):
         """Run complete NethVoice proxy test: inject, test, cleanup."""
         results = {
             "access": False,
@@ -333,9 +375,21 @@ exten => _+X.,1,Answer()
             results["access"] = True
             print("OK - FreePBX container accessible")
 
+            # 1.5 Detect Proxy if not provided
+            if not outbound_proxy:
+                detected = self.detect_outbound_proxy()
+                if detected:
+                    print(f"  \u2139 Auto-detected Outbound Proxy: {detected}")
+                    from main import ask_yes_no
+                    if ask_yes_no(f"Use detected proxy {detected}? [Y/n]", default='y'):
+                        outbound_proxy = detected
+            
+            if outbound_proxy:
+                 print(f"  Using Outbound Proxy: {outbound_proxy}")
+
             # 2. Inject config
             print("\n[PROXY TEST 2/6] Injecting temporary trunk config...")
-            if not self.inject_trunk(registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name):
+            if not self.inject_trunk(registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name, outbound_proxy):
                 print("ERRORE: Failed to write config files.")
                 results["diagnostics"].append("Config injection failed")
                 return results
