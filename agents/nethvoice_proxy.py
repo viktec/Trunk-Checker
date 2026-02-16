@@ -151,12 +151,27 @@ from_domain={registrar}
 """
 
         # -- Identify section --
+        # -- Identify section --
+        # Add proxy IP to match list so inbound calls from proxy are recognized
+        match_list = registrar
+        if outbound_proxy:
+            try:
+                # Extract IP/Host from proxy string (e.g. sip:10.5.4.1:5060;lr -> 10.5.4.1)
+                cleaned = outbound_proxy.replace("sip:", "")
+                cleaned = cleaned.split(";")[0]  # Remove params
+                proxy_host = cleaned.split(":")[0]  # Remove port
+                
+                if proxy_host and proxy_host != registrar:
+                    match_list = f"{registrar},{proxy_host}"
+            except:
+                pass
+
         identify_conf = f"""
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=identify
 endpoint={safe_name}
-match={registrar}
+match={match_list}
 """
 
         # -- Dialplan: catch-all extension to answer inbound calls --
