@@ -90,13 +90,13 @@ retry_interval=60
 expiration=300
 """
 
-        # -- Endpoint section --
+        # -- Endpoint section (use custom context so inbound calls are answered) --
         endpoint_conf = f"""
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=endpoint
 transport=transport-udp
-context=from-pstn-toheader
+context=trunkchk-inbound-test
 disallow=all
 allow=alaw
 allow=ulaw
@@ -117,12 +117,25 @@ endpoint={safe_name}
 match={registrar}
 """
 
+        # -- Dialplan: catch-all extension to answer inbound calls --
+        dialplan_conf = f"""
+; === TrunkChecker Temp Config ===
+[trunkchk-inbound-test]
+exten => _X.,1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+exten => _+X.,1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+"""
+
         files_to_write = {
             "/etc/asterisk/pjsip.auth_custom_post.conf": auth_conf,
             "/etc/asterisk/pjsip.aor_custom_post.conf": aor_conf,
             "/etc/asterisk/pjsip.registration_custom_post.conf": reg_conf,
             "/etc/asterisk/pjsip.endpoint_custom_post.conf": endpoint_conf,
             "/etc/asterisk/pjsip.identify_custom_post.conf": identify_conf,
+            "/etc/asterisk/extensions_custom.conf": dialplan_conf,
         }
 
         self.config_files = files_to_write
@@ -139,16 +152,21 @@ match={registrar}
 
         return True
 
-    def reload_asterisk(self):
-        """Reload pjsip module in Asterisk."""
+    def reload_asterisk(self, dialplan=False):
+        """Reload pjsip module (and optionally dialplan) in Asterisk."""
         self.logger.info("Reloading Asterisk pjsip...")
         out, err, code = self._exec("asterisk -rx 'module reload res_pjsip.so'", timeout=15)
         if code == 0:
             self.logger.info("pjsip reloaded successfully")
-            time.sleep(3)  # Give it time to register
-            return True
-        self.logger.error(f"Reload failed: {err}")
-        return False
+        else:
+            self.logger.error(f"pjsip reload failed: {err}")
+        
+        if dialplan:
+            self.logger.info("Reloading dialplan...")
+            self._exec("asterisk -rx 'dialplan reload'", timeout=10)
+        
+        time.sleep(3)  # Give it time to register
+        return code == 0
 
     def check_registration(self, timeout=15):
         """Check if the trunk registered successfully."""
@@ -191,49 +209,52 @@ match={registrar}
             self.logger.error(f"Originate command failed: {err}")
             return False
         
-        # Monitor channel to see if call actually connects
-        print("  Waiting for call to connect...")
+        # Monitor channel to see if call exists
+        # core show channels concise format: Channel!Context!Ext!Pri!State!App!...
+        # State is at index 4: Down=setup, Ringing=ringing, Up=answered
+        print("  Waiting for call to connect (Ctrl+C to skip)...")
         start = time.time()
-        call_seen = False
+        best_state = None
         try:
             while time.time() - start < ring_time + 5:
                 ch_out, _, ch_code = self._exec("asterisk -rx 'core show channels concise'")
                 if ch_code == 0 and ch_out.strip():
                     for line in ch_out.split("\n"):
                         if self.trunk_name.lower() in line.lower() or destination in line:
-                            state = line.split("!")[5] if line.count("!") >= 5 else ""
-                            self.logger.info(f"Outbound channel: {line.strip()}")
-                            if state in ("Up", "Ringing", "Ring"):
-                                call_seen = True
-                                print(f"  Call state: {state}")
-                                if state == "Up":
-                                    print("  Call answered!")
-                                    return True
+                            parts = line.split("!")
+                            state = parts[4] if len(parts) > 4 else "?"
+                            self.logger.info(f"Outbound channel [{state}]: {line.strip()}")
+                            
+                            if state == "Up":
+                                print(f"  ✅ Call answered!")
+                                return True
+                            elif state in ("Ringing", "Ring"):
+                                print(f"  📞 Phone ringing!")
+                                best_state = state
+                            elif state == "Down" and not best_state:
+                                best_state = "Down (setup)"
+                                print(f"\r  📡 Call in progress (SIP setup)...   ", end="", flush=True)
+                
+                # If we saw ringing, that's already a success
+                if best_state in ("Ringing", "Ring"):
+                    return True
+                    
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\n  Outbound test interrupted.")
         
-        if call_seen:
-            self.logger.info("Call was ringing/active")
-            return True
-        
-        # Fallback: check Asterisk log for INVITE attempt
-        log_out, _, _ = self._exec(f"grep -i 'INVITE.*{destination}' /var/log/asterisk/full 2>/dev/null | tail -3")
-        if log_out.strip():
-            self.logger.info(f"INVITE found in logs: {log_out[:200]}")
+        if best_state:
+            print(f"\n  Call reached state: {best_state}")
+            self.logger.info(f"Best call state seen: {best_state}")
             return True
         
         self.logger.error("No outbound channel detected")
         return False
 
     def wait_for_inbound(self, timeout=60):
-        """Monitor Asterisk log for incoming INVITE on this trunk."""
-        self.logger.info(f"Waiting for inbound call (monitoring log for {timeout}s)...")
+        """Monitor Asterisk channels for incoming call in trunkchk-inbound-test context."""
+        self.logger.info(f"Waiting for inbound call (monitoring channels for {timeout}s)...")
         print("  (Press Ctrl+C to skip)")
-        
-        # Mark current log position
-        mark_out, _, _ = self._exec("wc -l /var/log/asterisk/full 2>/dev/null | awk '{print $1}'")
-        log_start_line = mark_out.strip() if mark_out.strip() else "0"
         
         start = time.time()
         try:
@@ -242,27 +263,28 @@ match={registrar}
                 remaining = timeout - elapsed
                 print(f"\r  Listening... {remaining}s remaining  ", end="", flush=True)
                 
-                # Check for new INVITE in Asterisk log since we started
-                log_cmd = f"tail -n +{log_start_line} /var/log/asterisk/full 2>/dev/null | grep -i 'INVITE.*sip:' | grep -v 'Sending' | tail -3"
-                log_out, _, log_code = self._exec(log_cmd)
-                if log_code == 0 and log_out.strip():
-                    self.logger.info(f"Inbound INVITE detected in log: {log_out[:300]}")
-                    print(f"\n  Inbound INVITE detected!")
-                    return True
-                
-                # Also check channels (fast poll)
+                # Check for active channels in our custom context
                 ch_out, _, ch_code = self._exec("asterisk -rx 'core show channels concise'")
                 if ch_code == 0 and ch_out.strip():
-                    if "from-pstn" in ch_out or self.trunk_name in ch_out:
+                    if "trunkchk-inbound-test" in ch_out or self.trunk_name in ch_out:
                         self.logger.info(f"Inbound channel detected: {ch_out.strip()}")
-                        print(f"\n  Inbound channel detected!")
+                        print(f"\n  ✅ Inbound call detected and answered!")
+                        return True
+                
+                # Also check core show calls (count > 0)
+                calls_out, _, _ = self._exec("asterisk -rx 'core show calls'")
+                if calls_out and "active call" in calls_out.lower():
+                    count = calls_out.split()[0] if calls_out else "0"
+                    if count != "0":
+                        self.logger.info(f"Active calls: {calls_out.strip()}")
+                        print(f"\n  ✅ Inbound call detected ({calls_out.strip()})!")
                         return True
                 
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
         
-        print("\n  Inbound test completed.")
+        print("\n  Inbound test completed — no call detected.")
         return False
 
     def cleanup(self):
@@ -276,9 +298,14 @@ match={registrar}
             # Also remove any remaining lines with our trunk name
             cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
             self._exec(cmd)
+            # Remove trunkchk context lines from extensions_custom.conf
+            if "extensions_custom" in filepath:
+                self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
+                self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
+                self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
             self.logger.info(f"Cleaned {filepath}")
 
-        self.reload_asterisk()
+        self.reload_asterisk(dialplan=True)
         self.logger.info("Cleanup complete")
 
     def run_full_test(self, registrar, sip_port, trunk_number, auth_id, auth_pass, 
