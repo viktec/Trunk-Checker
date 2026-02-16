@@ -13,9 +13,19 @@ class SIPTransport:
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.bind_ip, self.bind_port))
+        try:
+            self.sock.bind((self.bind_ip, self.bind_port))
+            self.logger.info(f"SIP Transport listening on {self.bind_ip}:{self.bind_port}")
+        except OSError as e:
+            if "Address already in use" in str(e) or "[Errno 48]" in str(e) or "[WinError 10048]" in str(e):
+                self.logger.warning(f"Port {self.bind_port} is busy. Trying a random port...")
+                self.sock.bind((self.bind_ip, 0))
+                self.bind_port = self.sock.getsockname()[1]
+                self.logger.info(f"SIP Transport listening on random port {self.bind_port}")
+            else:
+                raise e
+        
         self.running = True
-        self.logger.info(f"SIP Transport listening on {self.bind_ip}:{self.bind_port}")
         
         t = threading.Thread(target=self._receive_loop, daemon=True)
         t.start()
@@ -44,6 +54,13 @@ class SIPTransport:
         if self.sock:
             self.sock.sendto(data, (target_ip, int(target_port)))
             self._notify_outbound(sip_message, target_ip, target_port)
+
+    def stop(self):
+        self.running = False
+        if self.sock:
+            self.sock.close()
+            if self.logger:
+                self.logger.info("SIP Transport stopped.")
             # Notify listeners for OUTBOUND traffic analysis
             # We pass a tuple or special object to indicate direction context if needed, 
             # or just rely on the listener to know it's being called from send.

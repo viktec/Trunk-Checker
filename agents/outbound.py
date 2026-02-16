@@ -50,7 +50,7 @@ class OutboundCallAgent:
 
     def make_call(self):
         # 1. Initial INVITE
-        contact = f"{self.local_ip}:5060"
+        contact = f"{self.local_ip}:{self.transport.bind_port}"
         to_uri = f"sip:{self.dest_number}@{self.registrar}"
         from_uri = f"sip:{self.trunk_number}@{self.registrar}"
         sdp = f"v=0\r\no=- 123456 123456 IN IP4 {self.local_ip}\r\ns=TrunkChecker\r\nc=IN IP4 {self.local_ip}\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000"
