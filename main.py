@@ -155,7 +155,14 @@ def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, 
 def main():
     print_banner()
     
-    # 1. Input Phase
+    # Mode selection
+    print("\n[TEST MODE]")
+    print("  1. Direct SIP Test (connect directly to provider)")
+    print("  2. NethVoice Proxy Test (test through Kamailio proxy)")
+    mode = get_input("Select mode [1/2, default: 1]")
+    mode = mode.strip() if mode.strip() else "1"
+    
+    # Common inputs
     print("\n[STEP 1] Configuration")
     registrar = get_input("SIP Registrar Address (Domain or IP)")
     sip_port_input = get_input("SIP Port [default: 5060]")
@@ -164,15 +171,53 @@ def main():
     auth_id = get_input("Authentication ID / Username")
     auth_pass = get_input("Authentication Password", hidden=True)
     destination_number = get_input("Destination Number for Outbound Test (optional)")
+    trunk_name_input = get_input("Trunk Name for FreePBX [default: auto]")
+    trunk_name = trunk_name_input.strip() if trunk_name_input.strip() else f"Trunk-{registrar.replace('.', '-')}"
+    
+    # ── NethVoice Proxy Mode ──
+    if mode == "2":
+        from agents.nethvoice_proxy import NethVoiceProxyTester
+        logger = setup_logger()
+        logger.info(f"NethVoice Proxy Test for Trunk: {target_trunk} @ {registrar}")
+        
+        container = get_input("FreePBX container name [default: freepbx]")
+        container = container.strip() if container.strip() else "freepbx"
+        
+        tester = NethVoiceProxyTester(logger, container_name=container)
+        results = tester.run_full_test(
+            registrar=registrar,
+            sip_port=sip_port,
+            trunk_number=target_trunk,
+            auth_id=auth_id,
+            auth_pass=auth_pass,
+            destination_number=destination_number,
+            trunk_name=trunk_name,
+        )
+        
+        # Show FreePBX guide if registration was successful
+        if results["registration"]:
+            from agents.analysis import AnalysisAgent
+            dummy_agent = AnalysisAgent(logger)
+            print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, dummy_agent, outbound_proxy_uri="")
+        
+        # Show log
+        import glob, os
+        list_of_files = glob.glob('logs/*.log')
+        if list_of_files:
+            latest_file = max(list_of_files, key=os.path.getctime)
+            print(f"\n Full Debug Log: {os.path.abspath(latest_file)}")
+        
+        return
+    
+    # ── Direct SIP Mode (original flow) ──
     outbound_proxy_input = get_input("Outbound Proxy (e.g. sip:10.5.4.1:5060;lr) [leave empty for direct]")
     outbound_proxy = None
     outbound_proxy_port = 5060
-    outbound_proxy_uri = ""  # Full URI for FreePBX guide
+    outbound_proxy_uri = ""
     if outbound_proxy_input.strip():
         raw = outbound_proxy_input.strip()
-        outbound_proxy_uri = raw  # Save original for FreePBX config
-        # Parse sip:IP:PORT;lr format
-        cleaned = raw.replace("sip:", "").split(";")[0]  # Remove sip: prefix and ;lr suffix
+        outbound_proxy_uri = raw
+        cleaned = raw.replace("sip:", "").split(";")[0]
         if ":" in cleaned:
             parts = cleaned.split(":")
             outbound_proxy = parts[0]
@@ -183,8 +228,7 @@ def main():
         else:
             outbound_proxy = cleaned
         print(f"  -> Proxy parsed: {outbound_proxy}:{outbound_proxy_port}")
-    trunk_name_input = get_input("Trunk Name for FreePBX [default: auto]")
-    trunk_name = trunk_name_input.strip() if trunk_name_input.strip() else f"Trunk-{registrar.replace('.', '-')}"
+    
     
     logger = setup_logger()
     logger.info(f"Starting diagnosis for Trunk: {target_trunk} @ {registrar}")
