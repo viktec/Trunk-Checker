@@ -15,6 +15,9 @@ class NethVoiceProxyTester:
         self.logger = logger
         self.container = container_name
         self.injected_routes = []  # Track injected DIDs
+        self.trunk_name = None
+        self.config_files = {}  # Track files we write to for cleanup
+        self._secrets = []  # Passwords to mask in logs
 
     def inject_inbound_route(self, did, apply=True):
         """Inject a temporary inbound route into FreePBX database."""
