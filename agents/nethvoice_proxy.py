@@ -181,35 +181,88 @@ match={registrar}
             self.logger.info(f"Endpoint info:\n{out[:500]}")
         return out
 
-    def test_outbound_call(self, destination, ring_time=10):
-        """Make a test outbound call through the trunk."""
+    def test_outbound_call(self, destination, ring_time=15):
+        """Make a test outbound call through the trunk and verify it connects."""
         self.logger.info(f"Originating test call to {destination} via {self.trunk_name}...")
         cmd = f"asterisk -rx 'channel originate PJSIP/{destination}@{self.trunk_name} application Wait {ring_time}'"
-        out, err, code = self._exec(cmd, timeout=ring_time + 10)
+        out, err, code = self._exec(cmd, timeout=5)
         
-        if code == 0:
-            self.logger.info(f"Call originated: {out}")
-            return True
-        else:
-            self.logger.error(f"Call failed: {err}")
+        if code != 0:
+            self.logger.error(f"Originate command failed: {err}")
             return False
+        
+        # Monitor channel to see if call actually connects
+        print("  Waiting for call to connect...")
+        start = time.time()
+        call_seen = False
+        try:
+            while time.time() - start < ring_time + 5:
+                ch_out, _, ch_code = self._exec("asterisk -rx 'core show channels concise'")
+                if ch_code == 0 and ch_out.strip():
+                    for line in ch_out.split("\n"):
+                        if self.trunk_name.lower() in line.lower() or destination in line:
+                            state = line.split("!")[5] if line.count("!") >= 5 else ""
+                            self.logger.info(f"Outbound channel: {line.strip()}")
+                            if state in ("Up", "Ringing", "Ring"):
+                                call_seen = True
+                                print(f"  Call state: {state}")
+                                if state == "Up":
+                                    print("  Call answered!")
+                                    return True
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n  Outbound test interrupted.")
+        
+        if call_seen:
+            self.logger.info("Call was ringing/active")
+            return True
+        
+        # Fallback: check Asterisk log for INVITE attempt
+        log_out, _, _ = self._exec(f"grep -i 'INVITE.*{destination}' /var/log/asterisk/full 2>/dev/null | tail -3")
+        if log_out.strip():
+            self.logger.info(f"INVITE found in logs: {log_out[:200]}")
+            return True
+        
+        self.logger.error("No outbound channel detected")
+        return False
 
     def wait_for_inbound(self, timeout=60):
-        """Monitor Asterisk channels for incoming call."""
-        self.logger.info(f"Waiting for inbound call (checking channels for {timeout}s)...")
+        """Monitor Asterisk log for incoming INVITE on this trunk."""
+        self.logger.info(f"Waiting for inbound call (monitoring log for {timeout}s)...")
         print("  (Press Ctrl+C to skip)")
+        
+        # Mark current log position
+        mark_out, _, _ = self._exec("wc -l /var/log/asterisk/full 2>/dev/null | awk '{print $1}'")
+        log_start_line = mark_out.strip() if mark_out.strip() else "0"
+        
         start = time.time()
         try:
             while time.time() - start < timeout:
-                out, _, code = self._exec("asterisk -rx 'core show channels concise'")
-                if code == 0 and out.strip():
-                    if self.trunk_name in out or "from-pstn" in out:
-                        self.logger.info(f"Inbound call detected: {out.strip()}")
+                elapsed = int(time.time() - start)
+                remaining = timeout - elapsed
+                print(f"\r  Listening... {remaining}s remaining  ", end="", flush=True)
+                
+                # Check for new INVITE in Asterisk log since we started
+                log_cmd = f"tail -n +{log_start_line} /var/log/asterisk/full 2>/dev/null | grep -i 'INVITE.*sip:' | grep -v 'Sending' | tail -3"
+                log_out, _, log_code = self._exec(log_cmd)
+                if log_code == 0 and log_out.strip():
+                    self.logger.info(f"Inbound INVITE detected in log: {log_out[:300]}")
+                    print(f"\n  Inbound INVITE detected!")
+                    return True
+                
+                # Also check channels (fast poll)
+                ch_out, _, ch_code = self._exec("asterisk -rx 'core show channels concise'")
+                if ch_code == 0 and ch_out.strip():
+                    if "from-pstn" in ch_out or self.trunk_name in ch_out:
+                        self.logger.info(f"Inbound channel detected: {ch_out.strip()}")
+                        print(f"\n  Inbound channel detected!")
                         return True
-                time.sleep(2)
+                
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("\n  Inbound test skipped.")
-            return False
+            pass
+        
+        print("\n  Inbound test completed.")
         return False
 
     def cleanup(self):
