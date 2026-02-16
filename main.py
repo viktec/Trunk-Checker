@@ -27,6 +27,96 @@ def ask_yes_no(prompt, default='n'):
             return False
         print("  Please answer y/yes or n/no.")
 
+def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, analysis_agent):
+    """Print a FreePBX Trunk configuration guide based on test results."""
+    
+    # Build codec priority list from detected codecs
+    detected_codecs = analysis_agent.features.get("codecs", set())
+    
+    # Codec priority order (best quality -> most compatible)
+    codec_priority = []
+    codec_map = {
+        "OPUS/48000/2": ("opus", "OPUS - HD Wideband"),
+        "G722/16000": ("g722", "G.722 - HD Wideband"),
+        "PCMA/8000": ("alaw", "G.711a (alaw) - Standard Quality"),
+        "PCMU/8000": ("ulaw", "G.711u (ulaw) - Standard Quality"),
+        "G729/8000": ("g729", "G.729 - Low Bandwidth"),
+    }
+    
+    for codec_name, (short, label) in codec_map.items():
+        for detected in detected_codecs:
+            if codec_name in detected:
+                codec_priority.append((short, label))
+                break
+    
+    # If no codecs detected, suggest common defaults
+    if not codec_priority:
+        codec_priority = [
+            ("alaw", "G.711a (alaw) - Standard Quality"),
+            ("ulaw", "G.711u (ulaw) - Standard Quality"),
+        ]
+
+    # Feature-based recommendations
+    has_dtmf = analysis_agent.features.get("rfc2833", False)
+    has_srtp = analysis_agent.features.get("srtp", False)
+    
+    sep = "=" * 60
+    line = "-" * 60
+    
+    print(f"\n{sep}")
+    print("   FREEPBX TRUNK CONFIGURATION GUIDE")
+    print(f"{sep}")
+    
+    print(f"\n--- General Settings {line[20:]}")
+    print(f"  Trunk Name:           {trunk_name}")
+    print(f"  Outbound CallerID:    {trunk_number}")
+    print(f"  CID Options:          Force Trunk CID")
+    
+    print(f"\n--- SIP Settings (pjsip) {line[24:]}")
+    print(f"  Username:             {auth_id}")
+    print(f"  Secret:               ******* (your password)")
+    print(f"  Authentication:       Outbound")
+    print(f"  Registration:         Send")
+    print(f"  SIP Server:           {registrar}")
+    print(f"  SIP Server Port:      {sip_port}")
+    print(f"  Transport:            UDP (0.0.0.0)")
+    print(f"  Context:              from-trunk")
+    
+    print(f"\n--- Advanced Settings {line[21:]}")
+    print(f"  From User:            {trunk_number}")
+    print(f"  From Domain:          {registrar}")
+    print(f"  Contact User:         {trunk_number}")
+    print(f"  DTMF Mode:            {'RFC 4733 (RFC 2833)' if has_dtmf else 'Auto'}")
+    print(f"  Media Encryption:     {'SRTP via in-SDP' if has_srtp else 'None (Disabled)'}")
+    print(f"  Qualify Frequency:    60")
+    print(f"  Match (Inbound):      {registrar}")
+    
+    print(f"\n--- Codec Priority {line[18:]}")
+    for i, (short, label) in enumerate(codec_priority, 1):
+        print(f"  {i}. {short:12s}  ->  {label}")
+    if has_dtmf:
+        print(f"  (telephone-event is auto-negotiated for DTMF)")
+    
+    print(f"\n--- Outbound Route {line[18:]}")
+    print(f"  Route Name:           Out-{trunk_name}")
+    print(f"  Trunk:                {trunk_name}")
+    print(f"  Dial Patterns:        Match your local dialing plan")
+    print(f"                        e.g. 0|XXXXXXX for local")
+    print(f"                             00|. for international")
+    
+    print(f"\n--- Inbound Route {line[17:]}")
+    print(f"  DID Number:           {trunk_number}")
+    print(f"  Trunk:                {trunk_name}")
+    print(f"  Destination:          (your IVR, Ring Group, Extension, etc.)")
+    
+    print(f"\n--- NAT Tips {line[12:]}")
+    print(f"  - Asterisk SIP Settings > NAT:  Yes (force_rport, comedia)")
+    print(f"  - If behind firewall, forward UDP {sip_port} + RTP range (10000-20000)")
+    print(f"  - Set External IP and Local Networks in Asterisk SIP Settings")
+    
+    print(f"\n{sep}\n")
+
+
 def main():
     print_banner()
     
@@ -39,6 +129,8 @@ def main():
     auth_id = get_input("Authentication ID / Username")
     auth_pass = get_input("Authentication Password", hidden=True)
     destination_number = get_input("Destination Number for Outbound Test (optional)")
+    trunk_name_input = get_input("Trunk Name for FreePBX [default: auto]")
+    trunk_name = trunk_name_input.strip() if trunk_name_input.strip() else f"Trunk-{registrar.replace('.', '-')}"
     
     logger = setup_logger()
     logger.info(f"Starting diagnosis for Trunk: {target_trunk} @ {registrar}")
@@ -133,6 +225,9 @@ def main():
         
         # 5. Report
         snoop_agent.print_report()
+        
+        # 6. FreePBX Configuration Guide
+        print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent)
         
         # Show log location
         import glob
