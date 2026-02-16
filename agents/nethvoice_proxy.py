@@ -174,13 +174,17 @@ match={match_list}
 """
 
         # -- Dialplan: catch-all extension to answer inbound calls --
+        # Also include specific DID match to be sure
         dialplan_conf = f"""
 ; === TrunkChecker Temp Config ===
 [trunkchk-inbound-test]
-exten => _X.,1,Answer()
+exten => {auth_id},1,Answer()
  same => n,Wait(5)
  same => n,Hangup()
-exten => _+X.,1,Answer()
+exten => {trunk_number},1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+exten => _X.,1,Answer()
  same => n,Wait(5)
  same => n,Hangup()
 """
