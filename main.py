@@ -22,10 +22,12 @@ def main():
     
     # 1. Input Phase
     print("\n[STEP 1] Configuration")
+    registrar = get_input("SIP Registrar Address (Domain or IP)")
+    sip_port_input = get_input("SIP Port [default: 5060]")
+    sip_port = int(sip_port_input) if sip_port_input.strip() else 5060
     target_trunk = get_input("Main Trunk Number (e.g. +123456789)")
     auth_id = get_input("Authentication ID / Username")
     auth_pass = get_input("Authentication Password", hidden=True)
-    registrar = get_input("SIP Registrar Address (IP:Port or Domain)")
     destination_number = get_input("Destination Number for Outbound Test (optional)")
     
     logger = setup_logger()
@@ -38,20 +40,21 @@ def main():
     targets = dns_agent.resolve(registrar, "UDP") # Default to UDP for now
     
     target_ip = None
-    target_port = 5060
+    target_port = sip_port  # Use the user-specified port
     
     if not targets:
         print("❌ DNS Resolution Failed (No SRV/A records).")
         print("⚠️ Attempting to proceed with raw input as Host...")
         target_ip = registrar
-        target_port = 5060
     else:
         print(f"✅ DNS Resolved: {len(targets)} targets found.")
         for t in targets:
              print(f"   -> Priority/Order: n/a, Target: {t[0]}, Port: {t[1]}, Transport: {t[2]}")
         # Pick first target
         target_ip = targets[0][0]
-        target_port = targets[0][1]
+        # Only use DNS port if user left default
+        if sip_port == 5060 and targets[0][1] != 5060:
+            target_port = targets[0][1]
     
     # Shared Transport
     transport = SIPTransport(bind_port=5060, logger=logger)

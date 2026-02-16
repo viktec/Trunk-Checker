@@ -65,10 +65,12 @@ class RegistrationAgent:
         
         # 1. Initial REGISTER (No Auth)
         contact = f"{self.local_ip}:{self.transport.bind_port}"
+        # RFC 3261: Request-URI for REGISTER = registrar domain only
+        request_uri = f"sip:{self.registrar}"
         to_uri = f"sip:{self.trunk_number}@{self.registrar}"
         from_uri = f"sip:{self.trunk_number}@{self.registrar}"
         
-        msg = SIPMessage.build_register(to_uri, from_uri, contact, self.call_id, self.cseq)
+        msg = SIPMessage.build_register(request_uri, to_uri, from_uri, contact, self.call_id, self.cseq)
         self.transport.send(msg, self.reg_ip, self.reg_port)
         
         # Wait for response
@@ -98,7 +100,7 @@ class RegistrationAgent:
             qop = self._extract_param(auth_header, "qop")
             
             # 2. Authenticated REGISTER
-            msg = SIPMessage.build_register(to_uri, from_uri, contact, self.call_id, self.cseq)
+            msg = SIPMessage.build_register(request_uri, to_uri, from_uri, contact, self.call_id, self.cseq)
             
             cnonce = None
             nc = None
@@ -106,10 +108,11 @@ class RegistrationAgent:
                 cnonce = SIPMessage.generate_nonce(16)
                 nc = "00000001"
 
-            # Calculate Digest Response
-            response_hash = self._calc_digest("REGISTER", f"sip:{self.trunk_number}@{self.registrar}", realm, nonce, qop, cnonce, nc)
+            # Calculate Digest Response - URI must match Request-URI
+            digest_uri = f"sip:{self.registrar}"
+            response_hash = self._calc_digest("REGISTER", digest_uri, realm, nonce, qop, cnonce, nc)
             
-            auth_val = f'Digest username="{self.auth_id}", realm="{realm}", nonce="{nonce}", uri="sip:{self.trunk_number}@{self.registrar}", response="{response_hash}", algorithm=MD5'
+            auth_val = f'Digest username="{self.auth_id}", realm="{realm}", nonce="{nonce}", uri="{digest_uri}", response="{response_hash}", algorithm=MD5'
             
             if opaque:
                 auth_val += f', opaque="{opaque}"'
