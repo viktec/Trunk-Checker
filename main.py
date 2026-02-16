@@ -27,7 +27,7 @@ def ask_yes_no(prompt, default='n'):
             return False
         print("  Please answer y/yes or n/no.")
 
-def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, analysis_agent):
+def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, analysis_agent, outbound_proxy_uri=""):
     """Print a complete FreePBX Trunk configuration guide based on test results."""
     
     # Build codec priority list from detected codecs
@@ -101,7 +101,8 @@ def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, 
     print(f"  Expiration:                  300")
     print(f"  Max Retries:                 10000")
     print(f"  Qualify Frequency:           60")
-    print(f"  Outbound Proxy:              (vuoto)")
+    proxy_display = outbound_proxy_uri if outbound_proxy_uri else "(vuoto)"
+    print(f"  Outbound Proxy:              {proxy_display}")
     print(f"  Disable TOPOS proxy header:  No")
     print(f"  Disable SRTP proxy header:   {'No' if has_srtp else 'Yes'}")
     print(f"  User = Phone:                No")
@@ -163,6 +164,25 @@ def main():
     auth_id = get_input("Authentication ID / Username")
     auth_pass = get_input("Authentication Password", hidden=True)
     destination_number = get_input("Destination Number for Outbound Test (optional)")
+    outbound_proxy_input = get_input("Outbound Proxy (e.g. sip:10.5.4.1:5060;lr) [leave empty for direct]")
+    outbound_proxy = None
+    outbound_proxy_port = 5060
+    outbound_proxy_uri = ""  # Full URI for FreePBX guide
+    if outbound_proxy_input.strip():
+        raw = outbound_proxy_input.strip()
+        outbound_proxy_uri = raw  # Save original for FreePBX config
+        # Parse sip:IP:PORT;lr format
+        cleaned = raw.replace("sip:", "").split(";")[0]  # Remove sip: prefix and ;lr suffix
+        if ":" in cleaned:
+            parts = cleaned.split(":")
+            outbound_proxy = parts[0]
+            try:
+                outbound_proxy_port = int(parts[1])
+            except:
+                outbound_proxy_port = 5060
+        else:
+            outbound_proxy = cleaned
+        print(f"  -> Proxy parsed: {outbound_proxy}:{outbound_proxy_port}")
     trunk_name_input = get_input("Trunk Name for FreePBX [default: auto]")
     trunk_name = trunk_name_input.strip() if trunk_name_input.strip() else f"Trunk-{registrar.replace('.', '-')}"
     
@@ -191,6 +211,14 @@ def main():
         # Only use DNS port if user left default
         if sip_port == 5060 and targets[0][1] != 5060:
             target_port = targets[0][1]
+    
+    # If Outbound Proxy is set, route ALL traffic through it
+    using_proxy = False
+    if outbound_proxy:
+        using_proxy = True
+        print(f"\n[PROXY MODE] Routing SIP traffic through proxy: {outbound_proxy}:{outbound_proxy_port}")
+        target_ip = outbound_proxy
+        target_port = outbound_proxy_port
     
     # Shared Transport
     transport = SIPTransport(bind_port=5060, logger=logger)
@@ -230,10 +258,18 @@ def main():
         reg_agent = RegistrationAgent(target_trunk, auth_id, auth_pass, registrar, logger, transport, target_ip=target_ip, target_port=target_port)
         if reg_agent.register():
             print("✅ Registration Successful!")
+            if using_proxy:
+                print("   (through proxy - proxy forwards registration to provider)")
         else:
             print("❌ Registration Failed. Checking logs...")
-            # We might still proceed to call testing if user wants, but typically reg failure stops us
-            # sys.exit(1) 
+            if using_proxy:
+                print("\n   [PROXY DIAGNOSTIC]")
+                print(f"   Registration failed through proxy {outbound_proxy}:{outbound_proxy_port}")
+                print("   Possible causes:")
+                print(f"   1. Proxy {outbound_proxy}:{outbound_proxy_port} not reachable")
+                print(f"   2. Proxy not configured to forward to {registrar}")
+                print("   3. Proxy blocking this domain/auth")
+                print("   4. Try testing WITHOUT proxy to isolate the issue")
 
         # 3. Inbound Call Test
         print("\n[STEP 3] Inbound Call Test")
@@ -243,8 +279,17 @@ def main():
             # Pass reg_agent to keep NAT open
             if inbound_agent.wait_for_call(timeout=60, keepalive_agent=reg_agent):
                 print("✅ Inbound Call Detected and Answered!")
+                if using_proxy:
+                    print("   (call arrived through proxy - proxy routes inbound correctly)")
             else:
                 print("❌ No call detected within timeout.")
+                if using_proxy:
+                    print("\n   [PROXY DIAGNOSTIC]")
+                    print("   No inbound call detected through the proxy. Possible causes:")
+                    print(f"   1. Proxy not forwarding inbound calls from {registrar}")
+                    print("   2. Proxy NAT/routing misconfigured for this trunk")
+                    print("   3. Provider not routing calls to proxy IP")
+                    print("   4. Try testing WITHOUT proxy to isolate the issue")
 
         # 4. Outbound Call Test
         if destination_number:
@@ -254,14 +299,23 @@ def main():
                 outbound_agent = OutboundCallAgent(target_trunk, auth_id, auth_pass, registrar, destination_number, logger, transport, target_ip=target_ip, target_port=target_port)
                 if outbound_agent.make_call():
                      print("✅ Outbound Call Successful!")
+                     if using_proxy:
+                         print("   (call routed through proxy - proxy handles outbound correctly)")
                 else:
                      print("❌ Outbound Call Failed.")
+                     if using_proxy:
+                         print("\n   [PROXY DIAGNOSTIC]")
+                         print("   Outbound call failed through the proxy. Possible causes:")
+                         print(f"   1. Proxy not forwarding INVITE to {registrar}")
+                         print("   2. Codec mismatch between proxy and provider")
+                         print("   3. Proxy blocking outbound by ACL/permissions")
+                         print("   4. Try testing WITHOUT proxy to isolate the issue")
         
         # 5. Report
         snoop_agent.print_report()
         
         # 6. FreePBX Configuration Guide
-        print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent)
+        print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent, outbound_proxy_uri)
         
         # Show log location
         import glob
