@@ -118,7 +118,12 @@ class RegistrationAgent:
             
             msg.add_header("Authorization", auth_val)
             
-            msg.add_header("Authorization", auth_val)
+            # Determine Header Name
+            auth_header_name = "Authorization"
+            if resp.status_code == 407:
+                auth_header_name = "Proxy-Authorization"
+
+            msg.add_header(auth_header_name, auth_val)
             self.last_response = None # Clear previous
             self.transport.send(msg, self.reg_ip, self.reg_port)
             
