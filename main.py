@@ -102,7 +102,8 @@ def main():
         if do_inbound.lower() == 'y':
             print("Listening for incoming calls (60s timeout)...")
             inbound_agent = InboundCallAgent(logger, transport)
-            if inbound_agent.wait_for_call(timeout=60):
+            # Pass reg_agent to keep NAT open
+            if inbound_agent.wait_for_call(timeout=60, keepalive_agent=reg_agent):
                 print("✅ Inbound Call Detected and Answered!")
             else:
                 print("❌ No call detected within timeout.")

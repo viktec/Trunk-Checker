@@ -36,15 +36,23 @@ class RegistrationAgent:
         self.cseq = 1
         self.call_id = SIPMessage.generate_nonce(16)
         
-        # Determine local IP (quick hack)
-        self.local_ip = "127.0.0.1" 
+        # Determine IP for Contact Header
+        # Try to get Public IP first for better NAT traversal
+        self.local_ip = "127.0.0.1"
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            self.local_ip = s.getsockname()[0]
-            s.close()
+            import urllib.request
+            self.local_ip = urllib.request.urlopen('https://api.ipify.org', timeout=3).read().decode('utf8')
+            self.logger.info(f"Detected Public IP: {self.local_ip}")
         except:
-            pass
+             # Fallback to local private IP
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                self.local_ip = s.getsockname()[0]
+                s.close()
+                self.logger.info(f"Using Local IP: {self.local_ip}")
+            except:
+                pass
 
     def _handle_response(self, msg, addr):
         # Filter for this registration transaction
@@ -87,16 +95,28 @@ class RegistrationAgent:
             realm = self._extract_param(auth_header, "realm")
             nonce = self._extract_param(auth_header, "nonce")
             opaque = self._extract_param(auth_header, "opaque")
+            qop = self._extract_param(auth_header, "qop")
             
             # 2. Authenticated REGISTER
             msg = SIPMessage.build_register(to_uri, from_uri, contact, self.call_id, self.cseq)
             
+            cnonce = None
+            nc = None
+            if qop:
+                cnonce = SIPMessage.generate_nonce(16)
+                nc = "00000001"
+
             # Calculate Digest Response
-            response_hash = self._calc_digest("REGISTER", f"sip:{self.trunk_number}@{self.registrar}", realm, nonce)
+            response_hash = self._calc_digest("REGISTER", f"sip:{self.trunk_number}@{self.registrar}", realm, nonce, qop, cnonce, nc)
             
             auth_val = f'Digest username="{self.auth_id}", realm="{realm}", nonce="{nonce}", uri="sip:{self.trunk_number}@{self.registrar}", response="{response_hash}", algorithm=MD5'
+            
             if opaque:
                 auth_val += f', opaque="{opaque}"'
+            if qop:
+                 auth_val += f', qop=auth, cnonce="{cnonce}", nc={nc}'
+            
+            msg.add_header("Authorization", auth_val)
             
             msg.add_header("Authorization", auth_val)
             self.last_response = None # Clear previous
@@ -136,6 +156,26 @@ class RegistrationAgent:
             time.sleep(0.1)
         return None
 
+    def send_keepalive(self):
+        """
+        Sends an OPTIONS packet to keep NAT open.
+        """
+        try:
+            msg = SIPMessage("OPTIONS", f"sip:{self.registrar}")
+            msg.add_header("Via", f"SIP/2.0/UDP {self.local_ip}:{self.transport.bind_port};rport;branch=z9hG4bK{SIPMessage.generate_nonce()}")
+            msg.add_header("Max-Forwards", "70")
+            msg.add_header("To", f"sip:{self.registrar}")
+            msg.add_header("From", f"sip:{self.trunk_number}@{self.registrar};tag={SIPMessage.generate_nonce()}")
+            msg.add_header("Call-ID", SIPMessage.generate_nonce(16))
+            msg.add_header("CSeq", f"{int(time.time())} OPTIONS")
+            msg.add_header("Contact", f"<sip:{self.local_ip}:{self.transport.bind_port}>")
+            msg.add_header("User-Agent", "TrunkChecker/KeepAlive")
+            msg.add_header("Content-Length", "0")
+            
+            self.transport.send(msg, self.reg_ip, self.reg_port)
+        except Exception as e:
+            self.logger.error(f"KeepAlive Error: {e}")
+
     def _extract_param(self, header, key):
         import re
         match = re.search(f'{key}="([^"]+)"', header)
@@ -144,7 +184,7 @@ class RegistrationAgent:
         match = re.search(f'{key}=([^, ]+)', header)
         return match.group(1) if match else None
 
-    def _calc_digest(self, method, uri, realm, nonce):
+    def _calc_digest(self, method, uri, realm, nonce, qop=None, cnonce=None, nc=None):
         # HA1 = MD5(username:realm:password)
         ha1_str = f"{self.auth_id}:{realm}:{self.auth_pass}"
         ha1 = hashlib.md5(ha1_str.encode()).hexdigest()
@@ -153,6 +193,11 @@ class RegistrationAgent:
         ha2_str = f"{method}:{uri}"
         ha2 = hashlib.md5(ha2_str.encode()).hexdigest()
         
-        # Response = MD5(HA1:nonce:HA2)
-        resp_str = f"{ha1}:{nonce}:{ha2}"
+        # Response = MD5(HA1:nonce:HA2) for no qop
+        # Response = MD5(HA1:nonce:nc:cnonce:qop:HA2) for qop=auth
+        if qop and (qop == "auth" or "auth" in qop):
+            resp_str = f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"
+        else:
+            resp_str = f"{ha1}:{nonce}:{ha2}"
+            
         return hashlib.md5(resp_str.encode()).hexdigest()

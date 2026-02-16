@@ -79,7 +79,7 @@ class SIPMessage:
     @staticmethod
     def build_register(to_uri, from_uri, contact_uri, call_id, cseq, expire=3600):
         msg = SIPMessage("REGISTER", to_uri)
-        msg.add_header("Via", f"SIP/2.0/UDP {contact_uri};branch=z9hG4bK{SIPMessage.generate_nonce()}")
+        msg.add_header("Via", f"SIP/2.0/UDP {contact_uri};rport;branch=z9hG4bK{SIPMessage.generate_nonce()}")
         msg.add_header("Max-Forwards", "70")
         msg.add_header("To", to_uri)
         msg.add_header("From", f"{from_uri};tag={SIPMessage.generate_nonce()}")
