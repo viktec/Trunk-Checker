@@ -90,15 +90,18 @@ class InboundCallAgent:
     def wait_for_call(self, timeout=60, keepalive_agent=None):
         start = time.time()
         last_keepalive = 0
+        call_detected = False
         while time.time() - start < timeout:
-            # Any of these states means we detected the call
-            if self.call_state in ("ACTIVE", "ENDED", "ANSWERED", "CANCELLED"):
-                return True
-            # Even RINGING means the INVITE arrived
-            if self.call_state == "RINGING":
-                # Give it a moment for the flow to complete
-                time.sleep(3)
-                return True
+            if not call_detected:
+                # Phase 1: Wait for call detection
+                if self.call_state in ("RINGING", "ACTIVE", "ANSWERED", "ENDED", "CANCELLED"):
+                    call_detected = True
+                    self.logger.info("Call detected, waiting for termination...")
+            else:
+                # Phase 2: Wait for call to end
+                if self.call_state in ("ENDED", "CANCELLED"):
+                    self.logger.info("Call terminated.")
+                    return True
             
             # Send KeepAlive every 15s if agent provided
             if keepalive_agent and time.time() - last_keepalive > 15:
@@ -106,4 +109,7 @@ class InboundCallAgent:
                 last_keepalive = time.time()
                 
             time.sleep(0.5)
+        if call_detected:
+            self.logger.info("Call was detected but did not terminate within timeout.")
+            return True
         return False
