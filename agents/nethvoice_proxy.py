@@ -151,30 +151,17 @@ from_domain={registrar}
 """
 
         # -- Identify section --
-        # Add proxy IP to match list so inbound calls from proxy are recognized
-        match_list = registrar
-        if outbound_proxy:
-            try:
-                # Extract IP/Host from proxy string (e.g. sip:10.5.4.1:5060;lr -> 10.5.4.1)
-                cleaned = outbound_proxy.replace("sip:", "")
-                cleaned = cleaned.split(";")[0]  # Remove params
-                proxy_host = cleaned.split(":")[0]  # Remove port
-                
-                if proxy_host and proxy_host != registrar:
-                    match_list = f"{registrar},{proxy_host}"
-            except:
-                pass
-
         identify_conf = f"""
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=identify
 endpoint={safe_name}
-match={match_list}
+match={registrar}
 """
 
         # -- Dialplan: catch-all extension to answer inbound calls --
-        # Also include specific DID match to be sure
+        # We inject into [trunkchk-inbound-test] for matched calls
+        # AND into [from-pstn-custom](+) for anonymous/unmatched calls (fallback)
         dialplan_conf = f"""
 ; === TrunkChecker Temp Config ===
 [trunkchk-inbound-test]
@@ -185,6 +172,14 @@ exten => {trunk_number},1,Answer()
  same => n,Wait(5)
  same => n,Hangup()
 exten => _X.,1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+; (Continuation for cleanup safety)
+[from-pstn-custom](+)
+exten => {auth_id},1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+exten => {trunk_number},1,Answer()
  same => n,Wait(5)
  same => n,Hangup()
 """
