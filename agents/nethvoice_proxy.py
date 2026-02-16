@@ -16,11 +16,19 @@ class NethVoiceProxyTester:
         self.container = container_name
         self.trunk_name = None
         self.config_files = {}  # Track files we write to for cleanup
+        self._secrets = []  # Passwords to mask in logs
+
+    def _mask(self, text):
+        """Mask any secrets in text before logging."""
+        for secret in self._secrets:
+            if secret and secret in text:
+                text = text.replace(secret, "*" * 8)
+        return text
 
     def _exec(self, cmd, timeout=10):
         """Execute command inside the FreePBX container via podman."""
         full_cmd = f'podman exec {self.container} bash -c "{cmd}"'
-        self.logger.info(f"EXEC: {full_cmd}")
+        self.logger.info(f"EXEC: {self._mask(full_cmd)}")
         try:
             result = subprocess.run(
                 full_cmd, shell=True, capture_output=True, text=True, timeout=timeout
@@ -48,6 +56,7 @@ class NethVoiceProxyTester:
         """Write temporary pjsip config files for the trunk."""
         self.trunk_name = f"{self.TRUNK_PREFIX}{trunk_name or 'test'}"
         safe_name = self.trunk_name
+        self._secrets.append(auth_pass)  # Track for masking
 
         # -- Auth section --
         auth_conf = f"""
@@ -188,14 +197,19 @@ match={registrar}
     def wait_for_inbound(self, timeout=60):
         """Monitor Asterisk channels for incoming call."""
         self.logger.info(f"Waiting for inbound call (checking channels for {timeout}s)...")
+        print("  (Press Ctrl+C to skip)")
         start = time.time()
-        while time.time() - start < timeout:
-            out, _, code = self._exec("asterisk -rx 'core show channels concise'")
-            if code == 0 and out.strip():
-                if self.trunk_name in out or "from-pstn" in out:
-                    self.logger.info(f"Inbound call detected: {out.strip()}")
-                    return True
-            time.sleep(2)
+        try:
+            while time.time() - start < timeout:
+                out, _, code = self._exec("asterisk -rx 'core show channels concise'")
+                if code == 0 and out.strip():
+                    if self.trunk_name in out or "from-pstn" in out:
+                        self.logger.info(f"Inbound call detected: {out.strip()}")
+                        return True
+                time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n  Inbound test skipped.")
+            return False
         return False
 
     def cleanup(self):
@@ -231,7 +245,7 @@ match={registrar}
             # 1. Check access
             print("\n[PROXY TEST 1/6] Checking FreePBX container access...")
             if not self.check_access():
-                print("ERRORE: Cannot access FreePBX container.")
+                print("\u274c ERRORE: Cannot access FreePBX container.")
                 print("  Make sure you're running from the NethVoice module")
                 print("  and the 'freepbx' container is running.")
                 results["diagnostics"].append("Container access failed")
