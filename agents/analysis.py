@@ -63,22 +63,22 @@ class AnalysisAgent:
         }
         
         for label, key in features_map.items():
-            status = "✅ YES" if self.features[key] else "❌ NO"
+            status = "[OK] YES" if self.features[key] else "[NO]  NO"
             self.logger.info(f"{status} - {label}")
         
-        self.logger.info(f"✅ Codecs Detected: {', '.join(self.features['codecs']) if self.features['codecs'] else 'None'}")
+        self.logger.info(f"[OK] Codecs Detected: {', '.join(self.features['codecs']) if self.features['codecs'] else 'None'}")
 
         self.logger.info("\n[Compliance Checks]")
         if not self.warnings and not self.errors:
-             self.logger.info("✅ No obvious RFC violations found.")
+             self.logger.info("[OK] No obvious RFC violations found.")
         
         if self.warnings:
-            self.logger.info("⚠️ WARNINGS:")
+            self.logger.info("[WARN] WARNINGS:")
             for w in self.warnings:
                 self.logger.info(f"  - {w}")
         
         if self.errors:
-            self.logger.info("❌ ERRORS:")
+            self.logger.info("[FAIL] ERRORS:")
             for e in self.errors:
                 self.logger.info(f"  - {e}")
         self.logger.info("-----------------------\n")

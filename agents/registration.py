@@ -109,7 +109,18 @@ class RegistrationAgent:
                 return True
             else:
                 code = resp.status_code if resp else "Timeout"
-                self.logger.error(f"Registration Failed. Code: {code}")
+                msg_text = resp.reason_phrase if resp else "No Response"
+                self.logger.error(f"Registration Failed. Code: {code} {msg_text}")
+                
+                if resp and code == 403:
+                    self.logger.warning("403 Forbidden usually means:")
+                    self.logger.warning("1. Wrong Password")
+                    self.logger.warning("2. Wrong Username/Auth ID")
+                    self.logger.warning("3. IP Address not whitelisted by provider")
+                    warning_header = resp.get_header("Warning")
+                    if warning_header:
+                        self.logger.warning(f"Server Warning: {warning_header}")
+                
                 return False
                 
         self.logger.error(f"Unexpected response: {resp.status_code} {resp.reason_phrase}")

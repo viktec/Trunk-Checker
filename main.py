@@ -121,6 +121,14 @@ def main():
         
         # 5. Report
         snoop_agent.print_report()
+        
+        # Show log location
+        import glob
+        import os
+        list_of_files = glob.glob('logs/*.log') 
+        if list_of_files:
+            latest_file = max(list_of_files, key=os.path.getctime)
+            print(f"\n📄 Full Debug Log saved to: {os.path.abspath(latest_file)}")
 
     except KeyboardInterrupt:
         print("\nAborted by user.")
