@@ -17,6 +17,16 @@ def get_input(prompt, hidden=False):
         return getpass.getpass(f"{prompt}: ")
     return input(f"{prompt}: ")
 
+def ask_yes_no(prompt, default='n'):
+    """Ask a yes/no question. Accepts y/yes/n/no (case insensitive). Re-asks on invalid input."""
+    while True:
+        answer = input(f"{prompt}: ").strip().lower()
+        if answer in ('y', 'yes', 'si', 's'):
+            return True
+        if answer in ('n', 'no', ''):
+            return False
+        print("  Please answer y/yes or n/no.")
+
 def main():
     print_banner()
     
@@ -101,8 +111,7 @@ def main():
 
         # 3. Inbound Call Test
         print("\n[STEP 3] Inbound Call Test")
-        do_inbound = get_input("Do you want to simulate an INBOUND call? (Make a call to the Trunk now) [y/N]")
-        if do_inbound.lower() == 'y':
+        if ask_yes_no("Do you want to simulate an INBOUND call? (Make a call to the Trunk now) [y/N]"):
             print("Listening for incoming calls (60s timeout)...")
             inbound_agent = InboundCallAgent(logger, transport)
             # Pass reg_agent to keep NAT open
@@ -114,8 +123,7 @@ def main():
         # 4. Outbound Call Test
         if destination_number:
             print("\n[STEP 4] Outbound Call Test")
-            do_outbound = get_input(f"Do you want to CALL {destination_number}? [y/N]")
-            if do_outbound.lower() == 'y':
+            if ask_yes_no(f"Do you want to CALL {destination_number}? [y/N]"):
                 print(f"Calling {destination_number}...")
                 outbound_agent = OutboundCallAgent(target_trunk, auth_id, auth_pass, registrar, destination_number, logger, transport, target_ip=target_ip, target_port=target_port)
                 if outbound_agent.make_call():
