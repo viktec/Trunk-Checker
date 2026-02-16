@@ -148,12 +148,6 @@ def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, 
     print(f"  Trunk:                       {trunk_name}")
     print(f"  Destination:                 (IVR, Ring Group, Interno...)")
     
-    # ── NAT & Firewall ──
-    print(f"\n{'='*20} NAT & Firewall {'='*24}")
-    print(f"  - Asterisk SIP Settings > NAT:  Yes (force_rport, comedia)")
-    print(f"  - Forward UDP {sip_port} + RTP range (10000-20000)")
-    print(f"  - Imposta External IP e Local Networks")
-    
     print(f"\n{sep}\n")
 
 
