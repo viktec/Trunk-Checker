@@ -14,58 +14,9 @@ class NethVoiceProxyTester:
     def __init__(self, logger, container_name="freepbx"):
         self.logger = logger
         self.container = container_name
-        self.injected_routes = []  # Track injected DIDs
         self.trunk_name = None
         self.config_files = {}  # Track files we write to for cleanup
         self._secrets = []  # Passwords to mask in logs
-
-    def inject_inbound_route(self, did, apply=True):
-        """Inject a temporary inbound route into FreePBX database."""
-        if not did:
-            return False
-            
-        self.logger.info(f"Checking for existing inbound route for {did}...")
-        # Check if route exists
-        check_cmd = f"mysql -u root -D asterisk -Bse \"SELECT extension FROM incoming WHERE extension='{did}'\""
-        out, _, _ = self._exec(check_cmd)
-        
-        if out.strip() == did:
-            self.logger.info(f"Inbound route for {did} already exists. Skipping injection.")
-            print(f"  ℹ Inbound route for {did} already exists. Using it.")
-            return False
-
-        print(f"  Injecting temporary inbound route for {did}...")
-        # Inject route (pointing to Music On Hold for verification)
-        self.logger.info(f"Injecting route for {did} -> MusicOnHold")
-        
-        sql = f"INSERT INTO incoming (cidnum, extension, destination, description, privacymanager, alertinfo) VALUES ('', '{did}', 'app-blackhole,musiconhold,1', 'TrunkChecker_Temp', '0', '')"
-        out, err, code = self._exec(f'mysql -u root -D asterisk -e "{sql}"')
-        
-        if code != 0:
-            self.logger.error(f"Failed to inject route: {err}")
-            print(f"  ❌ Failed to inject inbound route: {err}")
-            return False
-        
-        self.injected_routes.append(did)
-        
-        if apply:
-            print("  Applying configuration (fwconsole reload)... This may take 10-20s")
-            self._exec("fwconsole reload")
-            
-        return True
-
-    def cleanup_inbound_route(self):
-        """Remove all injected inbound routes."""
-        if self.injected_routes:
-            print(f"\n[CLEANUP] Removing {len(self.injected_routes)} temporary inbound routes...")
-            for did in self.injected_routes:
-                self.logger.info(f"Removing route for {did}")
-                sql = f"DELETE FROM incoming WHERE extension='{did}' AND description='TrunkChecker_Temp'"
-                self._exec(f'mysql -u root -D asterisk -e "{sql}"')
-            
-            print("  Applying cleanup (fwconsole reload)...")
-            self._exec("fwconsole reload")
-            self.injected_routes = []
 
     def _mask(self, text):
         """Mask any secrets in text before logging."""
@@ -225,6 +176,14 @@ exten => _X.,1,Answer()
  same => n,Hangup()
 ; (Continuation for cleanup safety)
 [from-pstn-custom](+)
+exten => {auth_id},1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+exten => {trunk_number},1,Answer()
+ same => n,Wait(5)
+ same => n,Hangup()
+; Also inject into ext-did-custom to catch calls falling through from-trunk
+[ext-did-custom](+)
 exten => {auth_id},1,Answer()
  same => n,Wait(5)
  same => n,Hangup()
@@ -393,7 +352,6 @@ exten => {trunk_number},1,Answer()
 
     def cleanup(self):
         """Remove temporary config and reload."""
-        self.cleanup_inbound_route()
         self.logger.info("Cleaning up temporary trunk config...")
         
         for filepath in self.config_files:
@@ -461,25 +419,10 @@ exten => {trunk_number},1,Answer()
             results["inject"] = True
             print(f"OK - Trunk '{self.trunk_name}' config injected")
 
-            # 2.5 Inject Inbound Route (DB)
-            # Inject for both auth_id and trunk_number to cover all bases (as requested)
-            dids_to_inject = [auth_id]
-            if trunk_number and trunk_number != auth_id:
-                dids_to_inject.append(trunk_number)
-            
-            print(f"\n  Injecting temporary inbound routes for: {', '.join(dids_to_inject)}...")
-            need_reload = False
-            for did in dids_to_inject:
-                if self.inject_inbound_route(did, apply=False):
-                    need_reload = True
-            
-            if need_reload:
-                 print("  Applying configuration (fwconsole reload)... This may take 10-20s")
-                 self._exec("fwconsole reload")
-
             # 3. Reload and check registration
             print("\n[PROXY TEST 3/6] Reloading Asterisk and checking registration...")
-            self.reload_asterisk()
+            # Reload dialplan too since we modified extensions_custom.conf
+            self.reload_asterisk(dialplan=True)
             
             registered, detail = self.check_registration(timeout=20)
             results["registration"] = registered
