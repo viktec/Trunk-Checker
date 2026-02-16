@@ -9,6 +9,21 @@ class InboundCallAgent:
         self.remote_addr = None
         self.local_tag = SIPMessage.generate_nonce(8)
         
+        # Detect Public IP once
+        self.local_ip = "127.0.0.1"
+        try:
+            import urllib.request
+            self.local_ip = urllib.request.urlopen('https://api.ipify.org', timeout=3).read().decode('utf8')
+        except:
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                self.local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                pass
+        
         self.transport.add_listener(self._handle_request)
 
     def _handle_request(self, msg, addr):
@@ -16,13 +31,17 @@ class InboundCallAgent:
             self.logger.info(f"Incoming Call from {addr}")
             self._handle_invite(msg, addr)
         elif msg.method == "ACK":
-            if self.call_state == "RINGING" or self.call_state == "ANSWERED":
+            if self.call_state in ("RINGING", "ANSWERED"):
                 self.logger.info("Call Established (ACK received)")
                 self.call_state = "ACTIVE"
         elif msg.method == "BYE":
             self.logger.info("Call Terminated by remote")
             self._send_response(msg, 200, "OK", addr)
             self.call_state = "ENDED"
+        elif msg.method == "CANCEL":
+            self.logger.info("Call Cancelled by remote")
+            self._send_response(msg, 200, "OK", addr)
+            self.call_state = "CANCELLED"
 
     def _handle_invite(self, msg, addr):
         self.remote_addr = addr
@@ -37,21 +56,14 @@ class InboundCallAgent:
         
         # 3. Answer (200 OK) after delay
         time.sleep(2)
-        self.call_state = "ANSWERED"
         
-        # Simple SDP
-        # Need to determine local IP properly, for now use a placeholder or try to reuse transport info
-        local_ip = "127.0.0.1" # TODO: Fix this
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except:
-            pass
+        # Check if cancelled during ringing
+        if self.call_state == "CANCELLED":
+            return
+            
+        self.call_state = "ANSWERED"
 
-        sdp = f"v=0\r\no=- 123456 123456 IN IP4 {local_ip}\r\ns=TrunkChecker\r\nc=IN IP4 {local_ip}\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0 8 18\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:18 G729/8000"
+        sdp = f"v=0\r\no=- 123456 123456 IN IP4 {self.local_ip}\r\ns=TrunkChecker\r\nc=IN IP4 {self.local_ip}\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0 8 18\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:18 G729/8000"
         
         self._send_response(msg, 200, "OK", addr, body=sdp)
 
@@ -69,17 +81,7 @@ class InboundCallAgent:
         res.add_header("CSeq", req.get_header("CSeq"))
         
         if code == 200 and req.method == "INVITE":
-             # Need Contact
-             local_ip = "127.0.0.1" # Same hack
-             try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-             except:
-                pass
-             res.add_header("Contact", f"<sip:checker@{local_ip}:5060>")
+             res.add_header("Contact", f"<sip:checker@{self.local_ip}:{self.transport.bind_port}>")
              res.add_header("Content-Type", "application/sdp")
         
         res.body = body
@@ -89,14 +91,17 @@ class InboundCallAgent:
         start = time.time()
         last_keepalive = 0
         while time.time() - start < timeout:
-            if self.call_state == "ACTIVE":
+            # Any of these states means we detected the call
+            if self.call_state in ("ACTIVE", "ENDED", "ANSWERED", "CANCELLED"):
                 return True
-            if self.call_state == "ENDED":
+            # Even RINGING means the INVITE arrived
+            if self.call_state == "RINGING":
+                # Give it a moment for the flow to complete
+                time.sleep(3)
                 return True
             
             # Send KeepAlive every 15s if agent provided
             if keepalive_agent and time.time() - last_keepalive > 15:
-                # keepalive_agent.logger.info("Sending NAT Keep-Alive...")
                 keepalive_agent.send_keepalive()
                 last_keepalive = time.time()
                 
