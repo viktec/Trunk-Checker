@@ -66,8 +66,9 @@ class OutboundCallAgent:
 
         if resp.status_code in [401, 407]:
             # Authenticate
+            resp_code = resp.status_code
             self.logger.info("Authenticating Outbound Call...")
-            # We must send ACK to the 401
+            # We must send ACK to the 401/407
             ack = self._build_ack(resp)
             self._send(ack)
 
@@ -83,7 +84,11 @@ class OutboundCallAgent:
             auth_val = f'Digest username="{self.auth_id}", realm="{realm}", nonce="{nonce}", uri="sip:{self.dest_number}@{self.registrar}", response="{response_hash}", algorithm=MD5'
             if opaque:
                 auth_val += f', opaque="{opaque}"'
-            msg.add_header("Authorization", auth_val)
+
+            if resp_code == 407:
+                msg.add_header("Proxy-Authorization", auth_val)
+            else:
+                msg.add_header("Authorization", auth_val)
             
             self.last_response = None
             self._send(msg)
@@ -163,9 +168,8 @@ class OutboundCallAgent:
         while time.time() - start < timeout:
             if self.last_response:
                 res = self.last_response
-                if res.status_code >= 100: # Dont clear if it's 100/180, we might get more
-                    if res.status_code >= 200:
-                         self.last_response = None
+                if res.status_code >= 100:
+                    self.last_response = None
                     return res
             time.sleep(0.1)
         return None

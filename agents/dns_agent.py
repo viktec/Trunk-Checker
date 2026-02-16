@@ -1,10 +1,11 @@
 import dns.resolver
+import dns.exception
 
 class DNSAgent:
     def __init__(self, logger):
         self.logger = logger
         self.resolver = dns.resolver.Resolver()
-        self.resolver.lifetime = 2.0 # Timeout
+        self.resolver.lifetime = 3.0 # Timeout
         
     def resolve(self, domain, transport="UDP"):
         """
@@ -70,7 +71,8 @@ class DNSAgent:
                     # Prepend Priority/Weight info? For now just flatten
                     results.append(res)
             return results
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout, dns.resolver.LifetimeTimeout):
+            self.logger.warning(f"No SRV records found or timeout for {srv_domain}")
             return []
 
     def _resolve_a(self, host, port, transport):
