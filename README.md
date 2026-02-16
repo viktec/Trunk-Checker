@@ -46,7 +46,7 @@ python main.py
 3.  **Registration**: Tries to register with the SIP provider using Digest Authentication.
 4.  **Inbound Call Test**: (Optional) Listens for an incoming call to verify route headers and codecs.
 5.  **Outbound Call Test**: (Optional) Initiates a call to a destination number to verify authorization and early media.
-6.  **Final Report**: Generates a 3CX-style checklist report covering:
+6.  **Final Report**: Generates checklist report covering:
     *   RFC Compliance (Standard headers)
     *   Feature Support (PRACK, Session Timers, 100rel)
     *   Security (SRTP, Identity Headers)
