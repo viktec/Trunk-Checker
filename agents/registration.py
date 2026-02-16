@@ -56,7 +56,7 @@ class RegistrationAgent:
         self.transport.start()
         
         # 1. Initial REGISTER (No Auth)
-        contact = f"{self.local_ip}:5060"
+        contact = f"{self.local_ip}:{self.transport.bind_port}"
         to_uri = f"sip:{self.trunk_number}@{self.registrar}"
         from_uri = f"sip:{self.trunk_number}@{self.registrar}"
         
