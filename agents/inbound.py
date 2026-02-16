@@ -85,12 +85,20 @@ class InboundCallAgent:
         res.body = body
         self.transport.send(res, addr[0], addr[1])
 
-    def wait_for_call(self, timeout=60):
+    def wait_for_call(self, timeout=60, keepalive_agent=None):
         start = time.time()
+        last_keepalive = 0
         while time.time() - start < timeout:
             if self.call_state == "ACTIVE":
                 return True
             if self.call_state == "ENDED":
                 return True
+            
+            # Send KeepAlive every 15s if agent provided
+            if keepalive_agent and time.time() - last_keepalive > 15:
+                # keepalive_agent.logger.info("Sending NAT Keep-Alive...")
+                keepalive_agent.send_keepalive()
+                last_keepalive = time.time()
+                
             time.sleep(0.5)
         return False
