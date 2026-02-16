@@ -198,7 +198,8 @@ def main():
         if results["registration"]:
             from agents.analysis import AnalysisAgent
             dummy_agent = AnalysisAgent(logger)
-            print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, dummy_agent, outbound_proxy_uri="")
+            proxy_uri = results.get("outbound_proxy", "")
+            print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, dummy_agent, outbound_proxy_uri=proxy_uri)
         
         # Show log
         import glob, os
