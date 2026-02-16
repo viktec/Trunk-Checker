@@ -14,6 +14,12 @@ class DNSAgent:
         """
         self.logger.info(f"Resolving Domain: {domain}")
         
+        # 0. Check if domain is already an IP
+        import re
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", domain):
+            self.logger.info("Input is an IP address. Skipping DNS.")
+            return [(0, domain, 5060 if transport != "TLS" else 5061, transport)]
+        
         # 1. NAPTR
         try:
             naptr_answers = self.resolver.resolve(domain, 'NAPTR')

@@ -37,17 +37,21 @@ def main():
     dns_agent = DNSAgent(logger)
     targets = dns_agent.resolve(registrar, "UDP") # Default to UDP for now
     
+    target_ip = None
+    target_port = 5060
+    
     if not targets:
-        print("❌ DNS Resolution Failed. Cannot proceed.")
-        sys.exit(1)
-        
-    print(f"✅ DNS Resolved: {len(targets)} targets found.")
-    for t in targets:
-         print(f"   -> Priority/Order: n/a, Target: {t[0]}, Port: {t[1]}, Transport: {t[2]}")
-         
-    # Pick first target
-    target_ip = targets[0][0]
-    target_port = targets[0][1]
+        print("❌ DNS Resolution Failed (No SRV/A records).")
+        print("⚠️ Attempting to proceed with raw input as Host...")
+        target_ip = registrar
+        target_port = 5060
+    else:
+        print(f"✅ DNS Resolved: {len(targets)} targets found.")
+        for t in targets:
+             print(f"   -> Priority/Order: n/a, Target: {t[0]}, Port: {t[1]}, Transport: {t[2]}")
+        # Pick first target
+        target_ip = targets[0][0]
+        target_port = targets[0][1]
     
     # Shared Transport
     transport = SIPTransport(bind_port=5060, logger=logger)
