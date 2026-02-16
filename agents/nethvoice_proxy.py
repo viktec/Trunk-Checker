@@ -45,12 +45,45 @@ class NethVoiceProxyTester:
 
     def check_access(self):
         """Verify we can access the FreePBX container."""
+        # Check if container exists/runs
         out, err, code = self._exec("asterisk -rx 'core show version'")
-        if code == 0 and "Asterisk" in out:
-            self.logger.info(f"FreePBX container accessible: {out[:60]}")
+        if code == 0:
+            self.logger.info(f"FreePBX container accessible: {out.strip()}")
             return True
-        self.logger.error(f"Cannot access FreePBX container '{self.container}': {err}")
-        return False
+        else:
+            self.logger.error(f"FreePBX access failed: {err}")
+            return False
+
+    def detect_transport(self):
+        """Auto-detect the UDP transport name from Asterisk."""
+        # Assuming most FreePBX use 0.0.0.0-udp or transport-udp depending on version
+        
+        self.logger.info("Detecting PJSIP UDP transport...")
+        # Command: pjsip show transports
+        # Output cols: Transport: <Name> <Type> ...
+        cmd = "asterisk -rx 'pjsip show transports'"
+        out, err, code = self._exec(cmd)
+        
+        if code != 0:
+            self.logger.error("Failed to list transports")
+            return "0.0.0.0-udp" # Common default
+
+        lines = out.splitlines()
+        for line in lines:
+            line = line.strip()
+            # Example: Transport:  <TransportId........>  <Type>
+            #          Transport:  0.0.0.0-udp               udp   ...
+            if line.startswith("Transport:"):
+                parts = line.split()
+                # parts[0]=Transport:, parts[1]=Name, parts[2]=Type
+                if len(parts) >= 3 and parts[2] == "udp":
+                    t_name = parts[1]
+                    self.logger.info(f"Auto-detected UDP Transport: {t_name}")
+                    return t_name
+                    
+        self.logger.warning("No explicit UDP transport found, using fallback '0.0.0.0-udp'")
+        return "0.0.0.0-udp"
+
 
     def detect_outbound_proxy(self):
         """Auto-detect the outbound proxy from existing FreePBX/pjsip config."""
@@ -90,7 +123,7 @@ class NethVoiceProxyTester:
         self.logger.info("No outbound proxy detected — Asterisk uses system-level routing")
         return None
 
-    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name=None, outbound_proxy=None):
+    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name=None, outbound_proxy=None, transport_name="0.0.0.0-udp"):
         """Write temporary pjsip config files for the trunk."""
         self.trunk_name = f"{self.TRUNK_PREFIX}{trunk_name or 'test'}"
         safe_name = self.trunk_name
@@ -121,7 +154,7 @@ qualify_frequency=60
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=registration
-transport=transport-udp
+transport={transport_name}
 outbound_auth={safe_name}
 {reg_proxy_line}
 server_uri=sip:{registrar}:{sip_port}
@@ -136,7 +169,7 @@ expiration=300
 ; === TrunkChecker Temp Config ===
 [{safe_name}]
 type=endpoint
-transport=transport-udp
+transport={transport_name}
 context=trunkchk-inbound-test
 disallow=all
 allow=alaw
@@ -412,6 +445,10 @@ exten => {trunk_number},1,Answer()
             results["access"] = True
             print("OK - FreePBX container accessible")
 
+            # 1.2 Detect Transport
+            transport_name = self.detect_transport()
+
+
             # 1.5 Detect Proxy if not provided
             if not outbound_proxy:
                 detected = self.detect_outbound_proxy()
@@ -427,7 +464,7 @@ exten => {trunk_number},1,Answer()
 
             # 2. Inject config
             print("\n[PROXY TEST 2/6] Injecting temporary trunk config...")
-            if not self.inject_trunk(registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name, outbound_proxy):
+            if not self.inject_trunk(registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name, outbound_proxy, transport_name=transport_name):
                 print("ERRORE: Failed to write config files.")
                 results["diagnostics"].append("Config injection failed")
                 return results
