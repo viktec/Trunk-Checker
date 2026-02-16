@@ -28,18 +28,17 @@ def ask_yes_no(prompt, default='n'):
         print("  Please answer y/yes or n/no.")
 
 def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, analysis_agent):
-    """Print a FreePBX Trunk configuration guide based on test results."""
+    """Print a complete FreePBX Trunk configuration guide based on test results."""
     
     # Build codec priority list from detected codecs
     detected_codecs = analysis_agent.features.get("codecs", set())
     
-    # Codec priority order (best quality -> most compatible)
     codec_priority = []
     codec_map = {
         "OPUS/48000/2": ("opus", "OPUS - HD Wideband"),
         "G722/16000": ("g722", "G.722 - HD Wideband"),
-        "PCMA/8000": ("alaw", "G.711a (alaw) - Standard Quality"),
-        "PCMU/8000": ("ulaw", "G.711u (ulaw) - Standard Quality"),
+        "PCMA/8000": ("alaw", "G.711a (alaw) - Standard"),
+        "PCMU/8000": ("ulaw", "G.711u (ulaw) - Standard"),
         "G729/8000": ("g729", "G.729 - Low Bandwidth"),
     }
     
@@ -49,70 +48,111 @@ def print_freepbx_guide(registrar, sip_port, trunk_number, auth_id, trunk_name, 
                 codec_priority.append((short, label))
                 break
     
-    # If no codecs detected, suggest common defaults
     if not codec_priority:
         codec_priority = [
-            ("alaw", "G.711a (alaw) - Standard Quality"),
-            ("ulaw", "G.711u (ulaw) - Standard Quality"),
+            ("alaw", "G.711a (alaw) - Standard"),
+            ("ulaw", "G.711u (ulaw) - Standard"),
         ]
 
-    # Feature-based recommendations
     has_dtmf = analysis_agent.features.get("rfc2833", False)
     has_srtp = analysis_agent.features.get("srtp", False)
+    has_pai = analysis_agent.features.get("p_identity", False)
     
     sep = "=" * 60
-    line = "-" * 60
     
     print(f"\n{sep}")
     print("   FREEPBX TRUNK CONFIGURATION GUIDE")
     print(f"{sep}")
     
-    print(f"\n--- General Settings {line[20:]}")
-    print(f"  Trunk Name:           {trunk_name}")
-    print(f"  Outbound CallerID:    {trunk_number}")
-    print(f"  CID Options:          Force Trunk CID")
+    # ── TAB: General ──
+    print(f"\n{'='*20} TAB: General {'='*26}")
+    print(f"  Trunk Name:                  {trunk_name}")
+    print(f"  Hide CallerID:               No")
+    print(f"  Outbound CallerID:           {trunk_number}")
+    print(f"  CID Options:                 Force Trunk CID")
+    print(f"  Maximum Channels:            (vuoto - nessun limite)")
+    print(f"  Asterisk Trunk Dial Options: System")
+    print(f"  Continue if Busy:            No")
+    print(f"  Disable Trunk:               No")
+    print(f"  Monitor Trunk Failures:      No")
     
-    print(f"\n--- SIP Settings (pjsip) {line[24:]}")
-    print(f"  Username:             {auth_id}")
-    print(f"  Secret:               ******* (your password)")
-    print(f"  Authentication:       Outbound")
-    print(f"  Registration:         Send")
-    print(f"  SIP Server:           {registrar}")
-    print(f"  SIP Server Port:      {sip_port}")
-    print(f"  Transport:            UDP (0.0.0.0)")
-    print(f"  Context:              from-trunk")
+    # ── TAB: pjsip Settings > General ──
+    print(f"\n{'='*20} TAB: pjsip > General {'='*19}")
+    print(f"  Username:                    {auth_id}")
+    print(f"  Auth Username:               {auth_id}")
+    print(f"  Secret:                      ******* (la tua password)")
+    print(f"  Authentication:              Outbound")
+    print(f"  Registration:                Send")
+    print(f"  Language Code:               Default")
+    print(f"  SIP Server:                  {registrar}")
+    print(f"  SIP Server Port:             {sip_port}")
+    print(f"  Context:                     from-pstn-toheader")
+    print(f"  Transport:                   0.0.0.0-udp")
     
-    print(f"\n--- Advanced Settings {line[21:]}")
-    print(f"  From User:            {trunk_number}")
-    print(f"  From Domain:          {registrar}")
-    print(f"  Contact User:         {trunk_number}")
-    print(f"  DTMF Mode:            {'RFC 4733 (RFC 2833)' if has_dtmf else 'Auto'}")
-    print(f"  Media Encryption:     {'SRTP via in-SDP' if has_srtp else 'None (Disabled)'}")
-    print(f"  Qualify Frequency:    60")
-    print(f"  Match (Inbound):      {registrar}")
+    # ── TAB: pjsip Settings > Advanced ──
+    print(f"\n{'='*20} TAB: pjsip > Advanced {'='*18}")
+    print(f"  DTMF Mode:                   {'RFC 4733' if has_dtmf else 'Auto'}")
+    print(f"  Send Line in Registration:   Yes")
+    print(f"  Send Connected Line:         No")
+    print(f"  Permanent Auth Rejection:    No")
+    print(f"  Forbidden Retry Interval:    10")
+    print(f"  Fatal Retry Interval:        0")
+    print(f"  General Retry Interval:      60")
+    print(f"  Expiration:                  300")
+    print(f"  Max Retries:                 10000")
+    print(f"  Qualify Frequency:           60")
+    print(f"  Outbound Proxy:              (vuoto)")
+    print(f"  Disable TOPOS proxy header:  No")
+    print(f"  Disable SRTP proxy header:   {'No' if has_srtp else 'Yes'}")
+    print(f"  User = Phone:                No")
+    print(f"  Contact User:                {auth_id}")
+    print(f"  From Domain:                 {registrar}")
+    print(f"  From User:                   {auth_id}")
+    print(f"  Client URI:                  (vuoto)")
+    print(f"  Server URI:                  (vuoto)")
+    print(f"  Media Address:               (vuoto)")
+    print(f"  AOR:                         (vuoto)")
+    print(f"  AOR Contact:                 (vuoto)")
+    print(f"  Match (Permit):              (vuoto)")
+    print(f"  Support Path:                No")
+    print(f"  Support T.38 UDPTL:          No")
+    print(f"  T.38 UDPTL Error Correction: None")
+    print(f"  T.38 UDPTL NAT:              No")
+    print(f"  T.38 UDPTL MAXDATAGRAM:      (vuoto)")
+    print(f"  Fax Detect:                  No")
+    print(f"  Trust RPID/PAI:              {'Yes' if has_pai else 'No'}")
+    send_rpid = "Send P-Asserted-Identity header" if has_pai else "No"
+    print(f"  Send RPID/PAI:               {send_rpid}")
+    print(f"  Send Private CallerID Info:  No")
+    print(f"  Match Inbound Auth:          Default")
+    print(f"  Inband Progress:             No")
     
-    print(f"\n--- Codec Priority {line[18:]}")
+    # ── TAB: Codecs ──
+    print(f"\n{'='*20} TAB: Codecs {'='*27}")
     for i, (short, label) in enumerate(codec_priority, 1):
         print(f"  {i}. {short:12s}  ->  {label}")
     if has_dtmf:
-        print(f"  (telephone-event is auto-negotiated for DTMF)")
+        print(f"  (telephone-event auto-negotiated for DTMF)")
     
-    print(f"\n--- Outbound Route {line[18:]}")
-    print(f"  Route Name:           Out-{trunk_name}")
-    print(f"  Trunk:                {trunk_name}")
-    print(f"  Dial Patterns:        Match your local dialing plan")
-    print(f"                        e.g. 0|XXXXXXX for local")
-    print(f"                             00|. for international")
+    # ── Outbound Route ──
+    print(f"\n{'='*20} Outbound Route {'='*24}")
+    print(f"  Route Name:                  Out-{trunk_name}")
+    print(f"  Trunk:                       {trunk_name}")
+    print(f"  Dial Patterns:               Segui il tuo piano di numerazione")
+    print(f"                               es. 0|XXXXXXX per locali")
+    print(f"                                   00|. per internazionali")
     
-    print(f"\n--- Inbound Route {line[17:]}")
-    print(f"  DID Number:           {trunk_number}")
-    print(f"  Trunk:                {trunk_name}")
-    print(f"  Destination:          (your IVR, Ring Group, Extension, etc.)")
+    # ── Inbound Route ──
+    print(f"\n{'='*20} Inbound Route {'='*25}")
+    print(f"  DID Number:                  {trunk_number}")
+    print(f"  Trunk:                       {trunk_name}")
+    print(f"  Destination:                 (IVR, Ring Group, Interno...)")
     
-    print(f"\n--- NAT Tips {line[12:]}")
+    # ── NAT & Firewall ──
+    print(f"\n{'='*20} NAT & Firewall {'='*24}")
     print(f"  - Asterisk SIP Settings > NAT:  Yes (force_rport, comedia)")
-    print(f"  - If behind firewall, forward UDP {sip_port} + RTP range (10000-20000)")
-    print(f"  - Set External IP and Local Networks in Asterisk SIP Settings")
+    print(f"  - Forward UDP {sip_port} + RTP range (10000-20000)")
+    print(f"  - Imposta External IP e Local Networks")
     
     print(f"\n{sep}\n")
 
