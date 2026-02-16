@@ -116,9 +116,7 @@ class RegistrationAgent:
             if qop:
                  auth_val += f', qop=auth, cnonce="{cnonce}", nc={nc}'
             
-            msg.add_header("Authorization", auth_val)
-            
-            # Determine Header Name
+            # Determine Header Name based on challenge type
             auth_header_name = "Authorization"
             if resp.status_code == 407:
                 auth_header_name = "Proxy-Authorization"
