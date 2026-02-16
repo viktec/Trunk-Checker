@@ -132,3 +132,6 @@ dmypy.json
 .vscode/
 .idea/
 *.swp
+
+# Local Documentation
+docs/agents/
