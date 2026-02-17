@@ -5,6 +5,7 @@ A comprehensive tool for verifying SIP Trunks, designed to validate registration
 ## Features
 
 - **Interactive Configuration**: Prompts for Main Trunk Number, Authentication ID, Password, and SIP Registrar Address.
+- **NethVoice Proxy Support**: Automated injection and testing for Kamailio/FreePBX environments with zero-touch config.
 - **Registration Verification**: detailed checks on registration status and sip negotiation.
 - **Call Testing**: 
   - Inbound Call Test
@@ -51,6 +52,21 @@ python main.py
     *   Feature Support (PRACK, Session Timers, 100rel)
     *   Security (SRTP, Identity Headers)
     *   Codecs Negotiation (G711, G729, Opus, etc.)
+
+## NethVoice/Kamailio Integration
+
+The tool includes a specialized **NethVoice Proxy Test** mode (Option 2) designed for complex proxy environments.
+
+### Key Features
+- **Zero-Touch Configuration**:
+  - **Auto-detects Outbound Proxy**: Scans existing PJSIP config to find the correct Kamailio IP (e.g., `10.5.4.1`).
+  - **Auto-detects Transport**: Dynamic detection of the correct UDP transport name (e.g., `0.0.0.0-udp`), preventing mismatch errors.
+- **Automated Injection**:
+  - Creates a temporary PJSIP Trunk & Endpoint in the FreePBX container.
+  - **Smart Inbound Routing**:
+    - Adds Proxy IP to `identify` list for authenticated routing.
+    - Injects **Dialplan Fallbacks** (`[ext-did-custom]`) to catch "Anonymous" calls if authentication fails.
+- **Safety**: All temporary configurations are automatically removed (cleaned up) after the test completes.
 
 ## Project Structure
 
