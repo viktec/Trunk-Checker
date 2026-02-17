@@ -33,25 +33,58 @@ cd Trunk-Checker
 pip install dnspython
 ```
 
-## Usage
+## Usage Scenarios
 
-Run the main script and follow the interactive prompts:
+### 1. Direct SIP Testing (Local / Node Direct)
+**Goal:** Verify registration and calls by connecting **directly** to the Provider's SIP Server (bypassing local proxies).
 
-```bash
-python main.py
-```
+- **Where to run**: Local machine, or on the Node/Server itself.
+- **Steps**:
+  1.  Clone the repository:
+      ```bash
+      git clone https://github.com/viktec/Trunk-Checker.git
+      cd Trunk-Checker
+      ```
+  2.  Run the script:
+      ```bash
+      python main.py
+      ```
+  3.  Select **Option 1: Direct SIP Test**.
+  4.  Enter credentials. The tool acts as a standalone SIP Endpoint.
 
-### Workflow
-1.  **Configuration**: Enter your Main Trunk Number, Auth ID, Password, and Registrar Domain.
-2.  **DNS Analysis**: The tool automatically checks for NAPTR and SRV records to determine the correct transport (UDP/TCP/TLS) and target IP.
-3.  **Registration**: Tries to register with the SIP provider using Digest Authentication.
-4.  **Inbound Call Test**: (Optional) Listens for an incoming call to verify route headers and codecs.
-5.  **Outbound Call Test**: (Optional) Initiates a call to a destination number to verify authorization and early media.
-6.  **Final Report**: Generates checklist report covering:
-    *   RFC Compliance (Standard headers)
-    *   Feature Support (PRACK, Session Timers, 100rel)
-    *   Security (SRTP, Identity Headers)
-    *   Codecs Negotiation (G711, G729, Opus, etc.)
+### 2. NethVoice/Kamailio Proxy Testing (Module Integration)
+**Goal:** Verify if the NethVoice Proxy (Kamailio) correctly handles the Trunk traffic (Registration/Inbound/Outbound).
+
+- **Where to run**: Inside the NethVoice container/module (e.g., `nethvoice1`).
+- **Steps**:
+  1.  Access the node via SSH.
+  2.  Enter the NethVoice module environment:
+      ```bash
+      runagent -m nethvoice1  # Replace with actual module name (e.g. nethvoice14, nethvoice1)
+      ```
+  3.  Clone or access the repository inside the module.
+  4.  Run the script:
+      ```bash
+      python main.py
+      ```
+  5.  Select **Option 2: NethVoice Proxy Test**.
+  6.  Follow the prompts. The script will automatically:
+      - Inject config into Asterisk.
+      - Register via the internal Proxy (10.5.x.x).
+      - Test Inbound/Outbound routing via the Proxy.
+
+### Test Execution Lifecycle
+Once running (in either mode), the tool performs the following checks:
+
+1.  **DNS Analysis**: Checks NAPTR and SRV records to determine correct transport (UDP/TCP/TLS) and target IP.
+2.  **Registration**: Attempts SIP REGISTER using Digest Authentication.
+3.  **Inbound Call Test** (Optional): Listens for an incoming call to verify route headers and codecs negotiation.
+4.  **Outbound Call Test** (Optional): Initiates a call to a destination to verify authorization and early media.
+5.  **Final Report**: Generates a detailed checklist covering:
+    - RFC Compliance (Standard headers)
+    - Feature Support (PRACK, Session Timers, 100rel)
+    - Security (SRTP, Identity Headers)
+    - Codecs Negotiation (G711, G729, Opus, etc.)
 
 ## NethVoice/Kamailio Integration
 
