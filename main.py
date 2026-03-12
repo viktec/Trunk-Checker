@@ -347,20 +347,84 @@ def main():
                 error_reason = resp.reason_phrase
                 print(f"\n   [PROVIDER ERROR] {error_code} {error_reason}")
                 
-                warning_header = resp.get_header("Warning")
-                if warning_header:
-                    print(f"   [WARNING] {warning_header}")
+                # Dump ALL headers from the provider response
+                print(f"\n   [FULL SIP RESPONSE HEADERS]")
+                for hdr_name, hdr_value in resp.headers.items():
+                    print(f"     {hdr_name}: {hdr_value}")
+                if resp.body:
+                    print(f"     [Body]: {resp.body[:200]}")
                 
-                if error_code == 401:
-                    print("   → 401 Unauthorized: wrong credentials or auth method")
-                elif error_code == 403:
-                    print("   → 403 Forbidden: credentials rejected or IP not whitelisted")
+                # Actionable diagnostics per error code
+                print(f"\n   ┌──────────────────────────────────────────────────┐")
+                print(f"   │          DIAGNOSTICA REGISTRAZIONE                │")
+                print(f"   └──────────────────────────────────────────────────┘")
+                
+                if error_code == 403:
+                    print(f"\n   Il provider ha risposto con 403 Forbidden.")
+                    print(f"   Il provider ha RIFIUTATO le credenziali.\n")
+                    print(f"   Cause più comuni (in ordine di probabilità):")
+                    print(f"   ──────────────────────────────────────────────")
+                    print(f"   1. PASSWORD ERRATA")
+                    print(f"      → Verifica la password con il provider")
+                    print(f"   2. AUTH ID / USERNAME ERRATO")
+                    print(f"      → Attuale: '{auth_id}'")
+                    print(f"      → Alcuni provider usano il numero intero come auth_id")
+                    print(f"      → Altri usano un username alfanumerico separato")
+                    print(f"   3. IP NON AUTORIZZATO dal provider")
+                    if using_proxy:
+                        print(f"      → Il provider deve autorizzare l'IP del proxy")
+                    else:
+                        print(f"      → Il provider deve autorizzare l'IP pubblico del server")
+                    print(f"      → Contatta il provider per verificare la whitelist IP")
+                    
+                    # Check the realm in WWW-Authenticate
+                    www_auth = resp.get_header("WWW-Authenticate")
+                    if www_auth:
+                        import re
+                        realm_match = re.search(r'realm="([^"]+)"', www_auth)
+                        if realm_match:
+                            realm = realm_match.group(1)
+                            print(f"   4. REALM del provider: '{realm}'")
+                            if realm != registrar:
+                                print(f"      ⚠️ Il realm NON corrisponde al registrar ({registrar})")
+                                print(f"      → Prova a usare '{realm}' come From Domain")
+                
+                elif error_code == 401:
+                    print(f"\n   Il provider ha risposto con 401 Unauthorized.")
+                    print(f"   L'autenticazione digest è fallita dopo il challenge.\n")
+                    print(f"   1. Verifica username e password")
+                    print(f"   2. Controlla il realm nella risposta (sopra)")
+                    print(f"   3. Potrebbe esserci un mismatch nel calcolo dell'hash digest")
+                
                 elif error_code == 404:
-                    print("   → 404 Not Found: wrong registrar or username")
+                    print(f"\n   Il provider ha risposto con 404 Not Found.\n")
+                    print(f"   1. Registrar errato: '{registrar}' potrebbe non essere corretto")
+                    print(f"   2. Username non esiste presso il provider")
+                
                 elif error_code == 407:
-                    print("   → 407 Proxy Auth Required: proxy authentication failed")
+                    print(f"\n   Il provider richiede Proxy Authentication (407).\n")
+                    print(f"   1. Serve un outbound proxy per questo provider")
+                    print(f"   2. Il proxy richiede credenziali separate")
+                
+                else:
+                    print(f"\n   Errore {error_code}: {error_reason}")
+                    print(f"   Controlla i dettagli negli header sopra.")
+            
             else:
                 print("\n   [ERROR] No response from registrar (timeout)")
+                print(f"\n   ┌──────────────────────────────────────────────────┐")
+                print(f"   │            DIAGNOSTICA TIMEOUT                    │")
+                print(f"   └──────────────────────────────────────────────────┘")
+                print(f"   Nessuna risposta ricevuta dal provider.\n")
+                print(f"   1. REGISTRAR NON RAGGIUNGIBILE")
+                print(f"      → Verifica che '{registrar}' sia risolvibile via DNS")
+                print(f"   2. FIREWALL BLOCCA IL TRAFFICO SIP")
+                print(f"      → Porta UDP {sip_port} deve essere aperta in uscita")
+                print(f"   3. PORTA SIP SBAGLIATA")
+                print(f"      → Prova con porta 5061 (TLS) o altre porte del provider")
+                if using_proxy:
+                    print(f"   4. PROXY NON RAGGIUNGE IL PROVIDER")
+                    print(f"      → Testa connettività dal proxy verso {registrar}:{sip_port}")
             
             if using_proxy:
                 print(f"\n   [PROXY DIAGNOSTIC]")

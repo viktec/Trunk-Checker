@@ -268,6 +268,57 @@ class NethVoiceProxyTester:
 
         return True
 
+    def enable_sip_debug(self):
+        """Enable PJSIP packet logging to capture full SIP exchange."""
+        self.logger.info("Enabling PJSIP SIP debug logging...")
+        self._exec("asterisk -rx 'pjsip set logger on'")
+
+    def disable_sip_debug(self):
+        """Disable PJSIP packet logging."""
+        self._exec("asterisk -rx 'pjsip set logger off'")
+
+    def capture_sip_log(self, lines=200):
+        """Capture the last N lines of the Asterisk log for SIP debug analysis."""
+        # Asterisk full log is usually at /var/log/asterisk/full
+        out, _, code = self._exec(f"tail -n {lines} /var/log/asterisk/full 2>/dev/null || tail -n {lines} /var/log/asterisk/messages 2>/dev/null", timeout=5)
+        if code == 0:
+            return out
+        return ""
+
+    def extract_sip_response(self, log_text, status_code=None):
+        """Extract the SIP response from captured log text.
+        
+        Looks for the full SIP response message (e.g., 403 Forbidden) 
+        including all headers and body that the provider sent back.
+        """
+        if not log_text:
+            return None
+        
+        lines = log_text.split("\n")
+        capturing = False
+        response_lines = []
+        
+        for line in lines:
+            # Look for the start of an inbound SIP response
+            # Asterisk logs them like: <--- Received SIP response ... ---
+            # Or the raw SIP line: SIP/2.0 403 Forbidden
+            if f"SIP/2.0 {status_code}" in line if status_code else "SIP/2.0 4" in line:
+                capturing = True
+                response_lines = [line]
+                continue
+            
+            if capturing:
+                # A blank/empty line or a new log entry starts = end of SIP message
+                stripped = line.strip()
+                if stripped.startswith("[") and "VERBOSE" in stripped:
+                    # New Asterisk log line — end of SIP message
+                    break
+                if stripped.startswith("<--") or stripped.startswith("---"):
+                    break
+                response_lines.append(line)
+        
+        return "\n".join(response_lines) if response_lines else None
+
     def reload_asterisk(self, dialplan=False):
         """Reload pjsip module (and optionally dialplan) in Asterisk."""
         self.logger.info("Reloading Asterisk pjsip...")
@@ -312,20 +363,34 @@ class NethVoiceProxyTester:
         """Get detailed registration error info from Asterisk."""
         self.logger.info(f"Getting registration error details for {self.trunk_name}...")
         
-        # Try pjsip show registration <name> for detailed status
+        details = []
+        
+        # 1. Try pjsip show registration <name> for detailed status
         out, _, code = self._exec(f"asterisk -rx 'pjsip show registration {self.trunk_name}'")
         if code == 0 and out.strip():
             self.logger.info(f"Registration detail:\n{out}")
-            return out
+            details.append(out)
         
-        # Fallback: check registrations list
-        out, _, _ = self._exec("asterisk -rx 'pjsip show registrations'")
-        if out:
-            for line in out.split("\n"):
-                if self.trunk_name in line:
-                    return line.strip()
+        # 2. Fallback: check registrations list
+        if not details:
+            out, _, _ = self._exec("asterisk -rx 'pjsip show registrations'")
+            if out:
+                for line in out.split("\n"):
+                    if self.trunk_name in line:
+                        details.append(line.strip())
         
-        return "Unable to retrieve error details"
+        # 3. Try to capture SIP response from Asterisk log (most valuable info)
+        log_text = self.capture_sip_log(lines=300)
+        if log_text:
+            # Look for 4xx/5xx responses related to our trunk
+            for error_code in [403, 401, 404, 407, 500, 503]:
+                sip_resp = self.extract_sip_response(log_text, error_code)
+                if sip_resp:
+                    details.append(f"\n  [SIP {error_code} Response from Provider]")
+                    details.append(sip_resp)
+                    break
+        
+        return "\n".join(details) if details else "Unable to retrieve error details"
 
     def check_endpoint(self):
         """Get endpoint details for diagnostics."""
@@ -450,6 +515,79 @@ class NethVoiceProxyTester:
                 self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
                 self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
 
+    def _print_rejection_diagnostics(self, error_detail, registrar, auth_id, outbound_proxy):
+        """Print detailed troubleshooting guide for rejected registrations."""
+        print("\n  ┌──────────────────────────────────────────────────┐")
+        print("  │          DIAGNOSTICA REGISTRAZIONE RIFIUTATA     │")
+        print("  └──────────────────────────────────────────────────┘")
+        
+        # Detect specific error code from the detail
+        is_403 = "403" in error_detail
+        is_401 = "401" in error_detail and "403" not in error_detail
+        
+        if is_403:
+            print("\n  Il provider ha risposto con 403 Forbidden.")
+            print("  Questo significa che il provider ha RIFIUTATO le credenziali.")
+            print("\n  Cause più comuni (in ordine di probabilità):")
+            print("  ──────────────────────────────────────────────")
+            print(f"  1. PASSWORD ERRATA")
+            print(f"     → Verifica la password con il provider")
+            print(f"  2. AUTH ID / USERNAME ERRATO")
+            print(f"     → Attuale: '{auth_id}'")
+            print(f"     → Alcuni provider usano il numero intero come auth_id")
+            print(f"     → Altri usano un username alfanumerico separato")
+            print(f"  3. IP NON AUTORIZZATO dal provider")
+            if outbound_proxy:
+                proxy_ip = outbound_proxy.replace("sip:", "").split(";")[0].split(":")[0]
+                print(f"     → Il provider deve autorizzare l'IP del proxy: {proxy_ip}")
+            else:
+                print(f"     → Il provider deve autorizzare l'IP pubblico del server")
+            print(f"     → Contatta il provider per verificare la whitelist IP")
+            print(f"  4. FROM DOMAIN ERRATO")
+            print(f"     → Attuale: '{registrar}'")
+            print(f"     → Alcuni provider richiedono un dominio specifico")
+            print(f"     → Prova a usare il numero come from_domain")
+            print(f"  5. CLIENT URI FORMATO ERRATO")
+            print(f"     → Prova: sip:{auth_id}@{registrar}")
+            print(f"     → Alcuni provider non vogliono la porta nel client_uri")
+        
+        elif is_401:
+            print("\n  Il provider ha risposto con 401 Unauthorized.")
+            print("  L'autenticazione digest è fallita.")
+            print("\n  Possibili soluzioni:")
+            print(f"  1. Verifica username e password nello schema digest")
+            print(f"  2. Verifica che il realm corrisponda (guardare sopra il SIP Response)")
+            print(f"  3. Alcuni provider richiedono auth_type=md5 invece di userpass")
+        
+        else:
+            print("\n  Registrazione rifiutata dal provider.")
+            print("  Controlla i dettagli dell'errore SIP sopra per più informazioni.")
+
+    def _print_timeout_diagnostics(self, registrar, outbound_proxy):
+        """Print detailed troubleshooting guide for registration timeouts."""
+        print("\n  ┌──────────────────────────────────────────────────┐")
+        print("  │            DIAGNOSTICA TIMEOUT REGISTRAZIONE     │")
+        print("  └──────────────────────────────────────────────────┘")
+        print("\n  Nessuna risposta ricevuta dal provider.")
+        print("\n  Possibili cause:")
+        print("  ──────────────────────────────────────────────")
+        print(f"  1. REGISTRAR NON RAGGIUNGIBILE")
+        print(f"     → Verifica che '{registrar}' sia risolvibile via DNS")
+        print(f"     → Testa: ping {registrar}")
+        if outbound_proxy:
+            proxy_ip = outbound_proxy.replace("sip:", "").split(";")[0].split(":")[0]
+            print(f"  2. PROXY NON RAGGIUNGE IL PROVIDER")
+            print(f"     → Il proxy ({proxy_ip}) deve poter raggiungere {registrar}:5060")
+            print(f"     → Testa dal server: nc -zvu {registrar} 5060")
+        print(f"  3. FIREWALL BLOCCA IL TRAFFICO SIP")
+        print(f"     → Porta UDP 5060 deve essere aperta in uscita")
+        print(f"     → Verifica iptables/firewalld sul server")
+        print(f"  4. PROVIDER IGNORA IL PACCHETTO")
+        print(f"     → L'IP sorgente potrebbe non essere autorizzato")
+        print(f"     → Il provider potrebbe richiedere TLS (porta 5061) invece di UDP")
+        print(f"  5. PORTA SIP SBAGLIATA")
+        print(f"     → Prova con porta 5061 (TLS) o altre porte del provider")
+
     def run_full_test(self, registrar, sip_port, trunk_number, auth_id, auth_pass, 
                       destination_number=None, trunk_name="test", outbound_proxy=None,
                       from_domain=None, client_uri=None, server_uri=None):
@@ -529,14 +667,20 @@ class NethVoiceProxyTester:
                 results["inject"] = True
                 print(f"OK - Trunk '{self.trunk_name}' config injected")
 
-                # 3. Reload and check registration
+                # 3. Enable SIP debug, reload and check registration
                 step3_label = "[PROXY TEST 3/6]" if attempt == 1 else f"[RETRY {attempt}]"
                 print(f"\n{step3_label} Reloading Asterisk and checking registration...")
+                
+                # Enable SIP debug BEFORE reload to capture the full exchange
+                self.enable_sip_debug()
                 self.reload_asterisk(dialplan=True)
                 
                 registered, detail = self.check_registration(timeout=20)
                 results["registration"] = registered
                 results["registration_detail"] = detail
+                
+                # Disable debug after check
+                self.disable_sip_debug()
                 
                 if registered:
                     print("OK - Trunk registered through proxy!")
@@ -545,19 +689,23 @@ class NethVoiceProxyTester:
                 # ── Registration failed ──
                 print(f"\n❌ Registration FAILED ({detail})")
                 
-                # Get detailed error from provider
+                # Get detailed error from provider (with full SIP response)
                 error_detail = self.get_registration_error()
                 print(f"\n  [PROVIDER ERROR DETAIL]")
-                print(f"  {error_detail}")
+                for line in error_detail.split("\n"):
+                    print(f"  {line}")
                 
                 if detail == "Rejected":
                     results["diagnostics"].append("Provider rejected credentials through proxy")
                     results["diagnostics"].append("Check: auth_id, password, provider IP whitelist")
+                    # Enhanced 403/401 specific diagnostics
+                    self._print_rejection_diagnostics(error_detail, registrar, auth_id, outbound_proxy)
                 elif detail == "Timeout":
                     results["diagnostics"].append("Registration timed out through proxy")
                     results["diagnostics"].append("Check: proxy connectivity to provider")
                     results["diagnostics"].append("Check: firewall rules on proxy")
                     results["diagnostics"].append("Check: Kamailio routing to provider domain")
+                    self._print_timeout_diagnostics(registrar, outbound_proxy)
 
                 # Ask user if they want to retry with different params
                 print("\n  Current configuration:")
