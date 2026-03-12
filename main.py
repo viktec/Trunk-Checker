@@ -183,6 +183,20 @@ def main():
         container = get_input("FreePBX container name [default: freepbx]")
         container = container.strip() if container.strip() else "freepbx"
         
+        # Advanced SIP fields (Enter = use default)
+        print("\n[STEP 2] Advanced SIP Settings (press Enter to keep default)")
+        
+        from_domain_input = get_input(f"  From Domain [default: {registrar}]")
+        from_domain = from_domain_input.strip() if from_domain_input.strip() else None
+        
+        default_server_uri = f"sip:{registrar}:{sip_port}"
+        server_uri_input = get_input(f"  Server URI [default: {default_server_uri}]")
+        server_uri = server_uri_input.strip() if server_uri_input.strip() else None
+        
+        default_client_uri = f"sip:{auth_id}@{registrar}:{sip_port}"
+        client_uri_input = get_input(f"  Client URI [default: {default_client_uri}]")
+        client_uri = client_uri_input.strip() if client_uri_input.strip() else None
+        
         tester = NethVoiceProxyTester(logger, container_name=container)
         results = tester.run_full_test(
             registrar=registrar,
@@ -192,6 +206,9 @@ def main():
             auth_pass=auth_pass,
             destination_number=destination_number,
             trunk_name=trunk_name,
+            from_domain=from_domain,
+            client_uri=client_uri,
+            server_uri=server_uri,
         )
         
         # Show FreePBX guide if registration was successful
@@ -211,24 +228,36 @@ def main():
         return
     
     # ── Direct SIP Mode (original flow) ──
+    def _parse_proxy_string(raw):
+        """Parse outbound proxy string into (host, port, uri) tuple."""
+        uri = raw
+        cleaned = raw.replace("sip:", "").split(";")[0]
+        if ":" in cleaned:
+            parts = cleaned.split(":")
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except:
+                port = 5060
+        else:
+            host = cleaned
+            port = 5060
+        return host, port, uri
+
     outbound_proxy_input = get_input("Outbound Proxy (e.g. sip:10.5.4.1:5060;lr) [leave empty for direct]")
     outbound_proxy = None
     outbound_proxy_port = 5060
     outbound_proxy_uri = ""
     if outbound_proxy_input.strip():
-        raw = outbound_proxy_input.strip()
-        outbound_proxy_uri = raw
-        cleaned = raw.replace("sip:", "").split(";")[0]
-        if ":" in cleaned:
-            parts = cleaned.split(":")
-            outbound_proxy = parts[0]
-            try:
-                outbound_proxy_port = int(parts[1])
-            except:
-                outbound_proxy_port = 5060
-        else:
-            outbound_proxy = cleaned
+        outbound_proxy, outbound_proxy_port, outbound_proxy_uri = _parse_proxy_string(outbound_proxy_input.strip())
         print(f"  -> Proxy parsed: {outbound_proxy}:{outbound_proxy_port}")
+    else:
+        # No proxy specified — ask if intentional
+        if ask_yes_no("No outbound proxy specified. Do you want to specify one? [y/N]"):
+            manual = get_input("  Outbound Proxy (e.g. sip:10.5.4.1:5060;lr)")
+            if manual.strip():
+                outbound_proxy, outbound_proxy_port, outbound_proxy_uri = _parse_proxy_string(manual.strip())
+                print(f"  -> Proxy parsed: {outbound_proxy}:{outbound_proxy_port}")
     
     
     logger = setup_logger()
@@ -274,8 +303,6 @@ def main():
     
     # Wrap listener to capture direction
     def packet_sniffer(msg, addr):
-        # We can't easy distinguish direction in the listener callback alone without context in SIPTransport
-        # But SIPTransport listeners only get INBOUND messages in current implementation
         snoop_agent.check_message(msg, "IN", addr)
         
     transport.add_listener(packet_sniffer)
@@ -288,27 +315,55 @@ def main():
     transport.start()
 
     try:
-        # 2. Registration Phase
+        # ── Registration Phase with Retry Loop ──
         print("\n[STEP 2] Verifying Registration...")
-        # Note: We pass original registrar as domain/URI, but we must config transport to use target_ip
-        # Current RegistrationAgent splits registrar string. We should modify it to accept explicit target.
-        # For now, let's just pass the resolved IP:PORT as "registrar" string to the agent and keep Domain in To/From?
-        # Actually RegistrationAgent needs refactor to separate Domain from Target IP.
-        
-        # Let's pass the resolved address to transport send, but keep registrar domain for SIP headers.
-        # We need to update RegistrationAgent signature or logic.
-        # Quick Fix: Pass "registrar_domain" and "target_ip" separately.
-        
-        # Updating RegistrationAgent initiation:
-        reg_agent = RegistrationAgent(target_trunk, auth_id, auth_pass, registrar, logger, transport, target_ip=target_ip, target_port=target_port)
-        if reg_agent.register():
-            print("✅ Registration Successful!")
+        registration_ok = False
+        max_retries = 10
+        attempt = 0
+        reg_agent = None
+
+        while attempt < max_retries:
+            attempt += 1
+
+            if attempt > 1:
+                print(f"\n[RETRY {attempt}] Attempting registration...")
+
+            reg_agent = RegistrationAgent(target_trunk, auth_id, auth_pass, registrar, logger, transport, target_ip=target_ip, target_port=target_port)
+            
+            if reg_agent.register():
+                print("✅ Registration Successful!")
+                if using_proxy:
+                    print("   (through proxy - proxy forwards registration to provider)")
+                registration_ok = True
+                break
+            
+            # ── Registration Failed ──
+            print("❌ Registration Failed.")
+            
+            # Show error details from the last response
+            if reg_agent.last_response:
+                resp = reg_agent.last_response
+                error_code = resp.status_code
+                error_reason = resp.reason_phrase
+                print(f"\n   [PROVIDER ERROR] {error_code} {error_reason}")
+                
+                warning_header = resp.get_header("Warning")
+                if warning_header:
+                    print(f"   [WARNING] {warning_header}")
+                
+                if error_code == 401:
+                    print("   → 401 Unauthorized: wrong credentials or auth method")
+                elif error_code == 403:
+                    print("   → 403 Forbidden: credentials rejected or IP not whitelisted")
+                elif error_code == 404:
+                    print("   → 404 Not Found: wrong registrar or username")
+                elif error_code == 407:
+                    print("   → 407 Proxy Auth Required: proxy authentication failed")
+            else:
+                print("\n   [ERROR] No response from registrar (timeout)")
+            
             if using_proxy:
-                print("   (through proxy - proxy forwards registration to provider)")
-        else:
-            print("❌ Registration Failed. Checking logs...")
-            if using_proxy:
-                print("\n   [PROXY DIAGNOSTIC]")
+                print(f"\n   [PROXY DIAGNOSTIC]")
                 print(f"   Registration failed through proxy {outbound_proxy}:{outbound_proxy_port}")
                 print("   Possible causes:")
                 print(f"   1. Proxy {outbound_proxy}:{outbound_proxy_port} not reachable")
@@ -316,51 +371,117 @@ def main():
                 print("   3. Proxy blocking this domain/auth")
                 print("   4. Try testing WITHOUT proxy to isolate the issue")
 
-        # 3. Inbound Call Test
-        print("\n[STEP 3] Inbound Call Test")
-        if ask_yes_no("Do you want to simulate an INBOUND call? (Make a call to the Trunk now) [y/N]"):
-            print("Listening for incoming calls (60s timeout)...")
-            inbound_agent = InboundCallAgent(logger, transport)
-            # Pass reg_agent to keep NAT open
-            if inbound_agent.wait_for_call(timeout=60, keepalive_agent=reg_agent):
-                print("✅ Inbound Call Detected and Answered!")
-                if using_proxy:
-                    print("   (call arrived through proxy - proxy routes inbound correctly)")
-            else:
-                print("❌ No call detected within timeout.")
-                if using_proxy:
-                    print("\n   [PROXY DIAGNOSTIC]")
-                    print("   No inbound call detected through the proxy. Possible causes:")
-                    print(f"   1. Proxy not forwarding inbound calls from {registrar}")
-                    print("   2. Proxy NAT/routing misconfigured for this trunk")
-                    print("   3. Provider not routing calls to proxy IP")
-                    print("   4. Try testing WITHOUT proxy to isolate the issue")
+            # Show current config
+            print("\n   Current configuration:")
+            print(f"     Registrar:       {registrar}")
+            print(f"     SIP Port:        {sip_port}")
+            print(f"     Auth ID:         {auth_id}")
+            print(f"     Trunk Number:    {target_trunk}")
+            print(f"     Outbound Proxy:  {outbound_proxy_uri or '(none)'}")
 
-        # 4. Outbound Call Test
-        if destination_number:
-            print("\n[STEP 4] Outbound Call Test")
-            if ask_yes_no(f"Do you want to CALL {destination_number}? [y/N]"):
-                print(f"Calling {destination_number}...")
-                outbound_agent = OutboundCallAgent(target_trunk, auth_id, auth_pass, registrar, destination_number, logger, transport, target_ip=target_ip, target_port=target_port)
-                if outbound_agent.make_call():
-                     print("✅ Outbound Call Successful!")
-                     if using_proxy:
-                         print("   (call routed through proxy - proxy handles outbound correctly)")
+            if not ask_yes_no("\n   Do you want to modify the data and retry? [y/N]"):
+                print("   Registration test aborted by user.")
+                break
+
+            # ── User wants to retry: ask for new values ──
+            print("\n   [MODIFY DATA] Press Enter to keep the current value:")
+            
+            new_registrar = get_input(f"     Registrar [{registrar}]")
+            if new_registrar.strip():
+                registrar = new_registrar.strip()
+
+            new_port = get_input(f"     SIP Port [{sip_port}]")
+            if new_port.strip():
+                try:
+                    sip_port = int(new_port.strip())
+                except ValueError:
+                    print("     Invalid port, keeping current value.")
+
+            new_auth_id = get_input(f"     Auth ID [{auth_id}]")
+            if new_auth_id.strip():
+                auth_id = new_auth_id.strip()
+
+            new_pass = get_input("     Password [****]", hidden=True)
+            if new_pass.strip():
+                auth_pass = new_pass.strip()
+
+            new_proxy = get_input(f"     Outbound Proxy [{outbound_proxy_uri or '(none)'}]")
+            if new_proxy.strip():
+                outbound_proxy, outbound_proxy_port, outbound_proxy_uri = _parse_proxy_string(new_proxy.strip())
+                using_proxy = True
+                target_ip = outbound_proxy
+                target_port = outbound_proxy_port
+            elif new_proxy == "":
+                # User pressed Enter — keep current
+                pass
+
+            # Re-resolve DNS if registrar changed
+            if new_registrar.strip():
+                targets = dns_agent.resolve(registrar, "UDP")
+                if targets:
+                    target_ip = targets[0][0]
+                    if sip_port == 5060 and targets[0][1] != 5060:
+                        target_port = targets[0][1]
                 else:
-                     print("❌ Outbound Call Failed.")
-                     if using_proxy:
-                         print("\n   [PROXY DIAGNOSTIC]")
-                         print("   Outbound call failed through the proxy. Possible causes:")
-                         print(f"   1. Proxy not forwarding INVITE to {registrar}")
-                         print("   2. Codec mismatch between proxy and provider")
-                         print("   3. Proxy blocking outbound by ACL/permissions")
-                         print("   4. Try testing WITHOUT proxy to isolate the issue")
-        
-        # 5. Report
-        snoop_agent.print_report()
-        
-        # 6. FreePBX Configuration Guide
-        print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent, outbound_proxy_uri)
+                    target_ip = registrar
+                
+                if using_proxy:
+                    target_ip = outbound_proxy
+                    target_port = outbound_proxy_port
+
+            print(f"\n   Retrying with updated configuration...")
+
+        # ── Only proceed with tests if registration succeeded ──
+        if not registration_ok:
+            print("\n⚠️  Registration not successful — skipping call tests.")
+            snoop_agent.print_report()
+            print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent, outbound_proxy_uri)
+        else:
+            # 3. Inbound Call Test
+            print("\n[STEP 3] Inbound Call Test")
+            if ask_yes_no("Do you want to simulate an INBOUND call? (Make a call to the Trunk now) [y/N]"):
+                print("Listening for incoming calls (60s timeout)...")
+                inbound_agent = InboundCallAgent(logger, transport)
+                # Pass reg_agent to keep NAT open
+                if inbound_agent.wait_for_call(timeout=60, keepalive_agent=reg_agent):
+                    print("✅ Inbound Call Detected and Answered!")
+                    if using_proxy:
+                        print("   (call arrived through proxy - proxy routes inbound correctly)")
+                else:
+                    print("❌ No call detected within timeout.")
+                    if using_proxy:
+                        print("\n   [PROXY DIAGNOSTIC]")
+                        print("   No inbound call detected through the proxy. Possible causes:")
+                        print(f"   1. Proxy not forwarding inbound calls from {registrar}")
+                        print("   2. Proxy NAT/routing misconfigured for this trunk")
+                        print("   3. Provider not routing calls to proxy IP")
+                        print("   4. Try testing WITHOUT proxy to isolate the issue")
+
+            # 4. Outbound Call Test
+            if destination_number:
+                print("\n[STEP 4] Outbound Call Test")
+                if ask_yes_no(f"Do you want to CALL {destination_number}? [y/N]"):
+                    print(f"Calling {destination_number}...")
+                    outbound_agent = OutboundCallAgent(target_trunk, auth_id, auth_pass, registrar, destination_number, logger, transport, target_ip=target_ip, target_port=target_port)
+                    if outbound_agent.make_call():
+                         print("✅ Outbound Call Successful!")
+                         if using_proxy:
+                             print("   (call routed through proxy - proxy handles outbound correctly)")
+                    else:
+                         print("❌ Outbound Call Failed.")
+                         if using_proxy:
+                             print("\n   [PROXY DIAGNOSTIC]")
+                             print("   Outbound call failed through the proxy. Possible causes:")
+                             print(f"   1. Proxy not forwarding INVITE to {registrar}")
+                             print("   2. Codec mismatch between proxy and provider")
+                             print("   3. Proxy blocking outbound by ACL/permissions")
+                             print("   4. Try testing WITHOUT proxy to isolate the issue")
+            
+            # 5. Report
+            snoop_agent.print_report()
+            
+            # 6. FreePBX Configuration Guide
+            print_freepbx_guide(registrar, sip_port, target_trunk, auth_id, trunk_name, snoop_agent, outbound_proxy_uri)
         
         # Show log location
         import glob
@@ -377,9 +498,6 @@ def main():
         print(f"\nExample error: {e}")
     finally:
         transport.stop()
-
-    # 3. Call Testing Phase
-    # ... inputs for call testing ...
 
 if __name__ == "__main__":
     main()

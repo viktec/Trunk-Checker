@@ -8,6 +8,11 @@ import time
 import re
 
 
+# Unique markers for config blocks — cleanup uses these for reliable deletion
+_MARKER_START = "; === TrunkChecker START ==="
+_MARKER_END = "; === TrunkChecker END ==="
+
+
 class NethVoiceProxyTester:
     TRUNK_PREFIX = "_trunkchk_"  # Prefix for temp trunk name to avoid collisions
 
@@ -45,7 +50,6 @@ class NethVoiceProxyTester:
 
     def check_access(self):
         """Verify we can access the FreePBX container."""
-        # Check if container exists/runs
         out, err, code = self._exec("asterisk -rx 'core show version'")
         if code == 0:
             self.logger.info(f"FreePBX container accessible: {out.strip()}")
@@ -56,26 +60,19 @@ class NethVoiceProxyTester:
 
     def detect_transport(self):
         """Auto-detect the UDP transport name from Asterisk."""
-        # Assuming most FreePBX use 0.0.0.0-udp or transport-udp depending on version
-        
         self.logger.info("Detecting PJSIP UDP transport...")
-        # Command: pjsip show transports
-        # Output cols: Transport: <Name> <Type> ...
         cmd = "asterisk -rx 'pjsip show transports'"
         out, err, code = self._exec(cmd)
         
         if code != 0:
             self.logger.error("Failed to list transports")
-            return "0.0.0.0-udp" # Common default
+            return "0.0.0.0-udp"
 
         lines = out.splitlines()
         for line in lines:
             line = line.strip()
-            # Example: Transport:  <TransportId........>  <Type>
-            #          Transport:  0.0.0.0-udp               udp   ...
             if line.startswith("Transport:"):
                 parts = line.split()
-                # parts[0]=Transport:, parts[1]=Name, parts[2]=Type
                 if len(parts) >= 3 and parts[2] == "udp":
                     t_name = parts[1]
                     self.logger.info(f"Auto-detected UDP Transport: {t_name}")
@@ -123,122 +120,130 @@ class NethVoiceProxyTester:
         self.logger.info("No outbound proxy detected — Asterisk uses system-level routing")
         return None
 
-    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name=None, outbound_proxy=None, transport_name="0.0.0.0-udp"):
+    def _build_config_block(self, lines):
+        """Build a config block wrapped in START/END markers, filtering out empty lines."""
+        filtered = [l for l in lines if l.strip()]
+        block = _MARKER_START + "\n"
+        block += "\n".join(filtered) + "\n"
+        block += _MARKER_END + "\n"
+        return block
+
+    def inject_trunk(self, registrar, sip_port, trunk_number, auth_id, auth_pass,
+                     trunk_name=None, outbound_proxy=None, transport_name="0.0.0.0-udp",
+                     from_domain=None, client_uri=None, server_uri=None):
         """Write temporary pjsip config files for the trunk."""
         self.trunk_name = f"{self.TRUNK_PREFIX}{trunk_name or 'test'}"
         safe_name = self.trunk_name
         self._secrets.append(auth_pass)  # Track for masking
 
+        # Defaults for optional fields
+        effective_from_domain = from_domain or registrar
+        effective_server_uri = server_uri or f"sip:{registrar}:{sip_port}"
+        effective_client_uri = client_uri or f"sip:{auth_id}@{registrar}:{sip_port}"
+
         # -- Auth section --
-        auth_conf = f"""
-; === TrunkChecker Temp Config ===
-[{safe_name}]
-type=auth
-auth_type=userpass
-username={auth_id}
-password={auth_pass}
-"""
+        auth_conf = self._build_config_block([
+            f"[{safe_name}]",
+            "type=auth",
+            "auth_type=userpass",
+            f"username={auth_id}",
+            f"password={auth_pass}",
+        ])
 
         # -- AOR section --
-        aor_conf = f"""
-; === TrunkChecker Temp Config ===
-[{safe_name}]
-type=aor
-contact=sip:{registrar}:{sip_port}
-qualify_frequency=60
-"""
+        aor_conf = self._build_config_block([
+            f"[{safe_name}]",
+            "type=aor",
+            f"contact=sip:{registrar}:{sip_port}",
+            "qualify_frequency=60",
+        ])
 
         # -- Registration section --
-        reg_proxy_line = f"outbound_proxy={outbound_proxy}" if outbound_proxy else ""
-        reg_conf = f"""
-; === TrunkChecker Temp Config ===
-[{safe_name}]
-type=registration
-transport={transport_name}
-outbound_auth={safe_name}
-{reg_proxy_line}
-server_uri=sip:{registrar}:{sip_port}
-client_uri=sip:{auth_id}@{registrar}:{sip_port}
-retry_interval=60
-expiration=300
-"""
+        reg_lines = [
+            f"[{safe_name}]",
+            "type=registration",
+            f"transport={transport_name}",
+            f"outbound_auth={safe_name}",
+        ]
+        if outbound_proxy:
+            reg_lines.append(f"outbound_proxy={outbound_proxy}")
+        reg_lines.extend([
+            f"server_uri={effective_server_uri}",
+            f"client_uri={effective_client_uri}",
+            "retry_interval=60",
+            "expiration=300",
+        ])
+        reg_conf = self._build_config_block(reg_lines)
 
-        # -- Endpoint section (use custom context so inbound calls are answered) --
-        ep_proxy_line = f"outbound_proxy={outbound_proxy}" if outbound_proxy else ""
-        endpoint_conf = f"""
-; === TrunkChecker Temp Config ===
-[{safe_name}]
-type=endpoint
-transport={transport_name}
-context=trunkchk-inbound-test
-disallow=all
-allow=alaw
-allow=ulaw
-allow=g729
-allow=opus
-outbound_auth={safe_name}
-{ep_proxy_line}
-aors={safe_name}
-from_user={auth_id}
-from_domain={registrar}
-"""
+        # -- Endpoint section --
+        ep_lines = [
+            f"[{safe_name}]",
+            "type=endpoint",
+            f"transport={transport_name}",
+            "context=trunkchk-inbound-test",
+            "disallow=all",
+            "allow=alaw",
+            "allow=ulaw",
+            "allow=g729",
+            "allow=opus",
+            f"outbound_auth={safe_name}",
+        ]
+        if outbound_proxy:
+            ep_lines.append(f"outbound_proxy={outbound_proxy}")
+        ep_lines.extend([
+            f"aors={safe_name}",
+            f"from_user={auth_id}",
+            f"from_domain={effective_from_domain}",
+        ])
+        endpoint_conf = self._build_config_block(ep_lines)
 
         # -- Identify section --
-        # -- Identify section --
-        # Add proxy IP to match list so inbound calls from proxy are recognized
         match_list = registrar
         if outbound_proxy:
             try:
-                # Extract IP/Host from proxy string (e.g. sip:10.5.4.1:5060;lr -> 10.5.4.1)
                 cleaned = outbound_proxy.replace("sip:", "")
-                cleaned = cleaned.split(";")[0]  # Remove params
-                proxy_host = cleaned.split(":")[0]  # Remove port
-                
+                cleaned = cleaned.split(";")[0]
+                proxy_host = cleaned.split(":")[0]
                 if proxy_host and proxy_host != registrar:
                     match_list = f"{registrar},{proxy_host}"
             except:
                 pass
 
-        identify_conf = f"""
-; === TrunkChecker Temp Config ===
-[{safe_name}]
-type=identify
-endpoint={safe_name}
-match={match_list}
-"""
+        identify_conf = self._build_config_block([
+            f"[{safe_name}]",
+            "type=identify",
+            f"endpoint={safe_name}",
+            f"match={match_list}",
+        ])
 
-        # -- Dialplan: catch-all extension to answer inbound calls --
-        # We inject into [trunkchk-inbound-test] for matched calls
-        # AND into [from-pstn-custom](+) for anonymous/unmatched calls (fallback)
-        dialplan_conf = f"""
-; === TrunkChecker Temp Config ===
-[trunkchk-inbound-test]
-exten => {auth_id},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-exten => {trunk_number},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-exten => _X.,1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-; (Continuation for cleanup safety)
-[from-pstn-custom](+)
-exten => {auth_id},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-exten => {trunk_number},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-; Also inject into ext-did-custom to catch calls falling through from-trunk
-[ext-did-custom](+)
-exten => {auth_id},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-exten => {trunk_number},1,Answer()
- same => n,Wait(5)
- same => n,Hangup()
-"""
+        # -- Dialplan --
+        dialplan_lines = [
+            "[trunkchk-inbound-test]",
+            f"exten => {auth_id},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            f"exten => {trunk_number},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            "exten => _X.,1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            "[from-pstn-custom](+)",
+            f"exten => {auth_id},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            f"exten => {trunk_number},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            "[ext-did-custom](+)",
+            f"exten => {auth_id},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+            f"exten => {trunk_number},1,Answer()",
+            " same => n,Wait(5)",
+            " same => n,Hangup()",
+        ]
+        dialplan_conf = self._build_config_block(dialplan_lines)
 
         files_to_write = {
             "/etc/asterisk/pjsip.auth_custom_post.conf": auth_conf,
@@ -303,6 +308,25 @@ exten => {trunk_number},1,Answer()
         self.logger.error(f"Registration timeout. Current state:\n{out}")
         return False, "Timeout"
 
+    def get_registration_error(self):
+        """Get detailed registration error info from Asterisk."""
+        self.logger.info(f"Getting registration error details for {self.trunk_name}...")
+        
+        # Try pjsip show registration <name> for detailed status
+        out, _, code = self._exec(f"asterisk -rx 'pjsip show registration {self.trunk_name}'")
+        if code == 0 and out.strip():
+            self.logger.info(f"Registration detail:\n{out}")
+            return out
+        
+        # Fallback: check registrations list
+        out, _, _ = self._exec("asterisk -rx 'pjsip show registrations'")
+        if out:
+            for line in out.split("\n"):
+                if self.trunk_name in line:
+                    return line.strip()
+        
+        return "Unable to retrieve error details"
+
     def check_endpoint(self):
         """Get endpoint details for diagnostics."""
         out, err, code = self._exec(f"asterisk -rx 'pjsip show endpoint {self.trunk_name}'")
@@ -320,9 +344,6 @@ exten => {trunk_number},1,Answer()
             self.logger.error(f"Originate command failed: {err}")
             return False
         
-        # Monitor channel to see if call exists
-        # core show channels concise format: Channel!Context!Ext!Pri!State!App!...
-        # State is at index 4: Down=setup, Ringing=ringing, Up=answered
         print("  Waiting for call to connect (Ctrl+C to skip)...")
         start = time.time()
         best_state = None
@@ -346,7 +367,6 @@ exten => {trunk_number},1,Answer()
                                 best_state = "Down (setup)"
                                 print(f"\r  📡 Call in progress (SIP setup)...   ", end="", flush=True)
                 
-                # If we saw ringing, that's already a success
                 if best_state in ("Ringing", "Ring"):
                     return True
                     
@@ -374,7 +394,6 @@ exten => {trunk_number},1,Answer()
                 remaining = timeout - elapsed
                 print(f"\r  Listening... {remaining}s remaining  ", end="", flush=True)
                 
-                # Check for active channels in our custom context
                 ch_out, _, ch_code = self._exec("asterisk -rx 'core show channels concise'")
                 if ch_code == 0 and ch_out.strip():
                     if "trunkchk-inbound-test" in ch_out or self.trunk_name in ch_out:
@@ -382,7 +401,6 @@ exten => {trunk_number},1,Answer()
                         print(f"\n  ✅ Inbound call detected and answered!")
                         return True
                 
-                # Also check core show calls (count > 0)
                 calls_out, _, _ = self._exec("asterisk -rx 'core show calls'")
                 if calls_out and "active call" in calls_out.lower():
                     count = calls_out.split()[0] if calls_out else "0"
@@ -403,10 +421,10 @@ exten => {trunk_number},1,Answer()
         self.logger.info("Cleaning up temporary trunk config...")
         
         for filepath in self.config_files:
-            # Remove lines between our markers
-            cmd = f"sed -i '/=== TrunkChecker Temp Config ===/,/^$/d' {filepath}"
+            # Delete everything between START and END markers (inclusive)
+            cmd = f"sed -i '/=== TrunkChecker START ===/,/=== TrunkChecker END ===/d' {filepath}"
             self._exec(cmd)
-            # Also remove any remaining lines with our trunk name
+            # Also remove any remaining lines with our trunk name (safety net)
             cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
             self._exec(cmd)
             # Remove trunkchk context lines from extensions_custom.conf
@@ -419,9 +437,25 @@ exten => {trunk_number},1,Answer()
         self.reload_asterisk(dialplan=True)
         self.logger.info("Cleanup complete")
 
+    def _cleanup_config_only(self):
+        """Remove config files without reloading — used before re-inject in retry loop."""
+        self.logger.info("Removing config (no reload)...")
+        for filepath in self.config_files:
+            cmd = f"sed -i '/=== TrunkChecker START ===/,/=== TrunkChecker END ===/d' {filepath}"
+            self._exec(cmd)
+            cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
+            self._exec(cmd)
+            if "extensions_custom" in filepath:
+                self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
+                self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
+                self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
+
     def run_full_test(self, registrar, sip_port, trunk_number, auth_id, auth_pass, 
-                      destination_number=None, trunk_name="test", outbound_proxy=None):
+                      destination_number=None, trunk_name="test", outbound_proxy=None,
+                      from_domain=None, client_uri=None, server_uri=None):
         """Run complete NethVoice proxy test: inject, test, cleanup."""
+        from main import ask_yes_no, get_input
+
         results = {
             "access": False,
             "inject": False,
@@ -448,42 +482,74 @@ exten => {trunk_number},1,Answer()
             # 1.2 Detect Transport
             transport_name = self.detect_transport()
 
-
             # 1.5 Detect Proxy if not provided
             if not outbound_proxy:
                 detected = self.detect_outbound_proxy()
                 if detected:
                     print(f"  \u2139 Auto-detected Outbound Proxy: {detected}")
-                    from main import ask_yes_no
                     if ask_yes_no(f"Use detected proxy {detected}? [Y/n]", default='y'):
                         outbound_proxy = detected
+                    else:
+                        # User rejected autodetected proxy — ask for manual one
+                        if ask_yes_no("Do you want to specify a different outbound proxy? [y/N]"):
+                            manual = get_input("  Outbound Proxy (e.g. sip:10.5.4.1:5060;lr)")
+                            if manual.strip():
+                                outbound_proxy = manual.strip()
+                else:
+                    # No proxy autodetected — ask if user wants to specify one
+                    if ask_yes_no("No proxy detected. Do you want to specify one manually? [y/N]"):
+                        manual = get_input("  Outbound Proxy (e.g. sip:10.5.4.1:5060;lr)")
+                        if manual.strip():
+                            outbound_proxy = manual.strip()
             
             if outbound_proxy:
                  print(f"  Using Outbound Proxy: {outbound_proxy}")
                  results["outbound_proxy"] = outbound_proxy
 
-            # 2. Inject config
-            print("\n[PROXY TEST 2/6] Injecting temporary trunk config...")
-            if not self.inject_trunk(registrar, sip_port, trunk_number, auth_id, auth_pass, trunk_name, outbound_proxy, transport_name=transport_name):
-                print("ERRORE: Failed to write config files.")
-                results["diagnostics"].append("Config injection failed")
-                return results
-            results["inject"] = True
-            print(f"OK - Trunk '{self.trunk_name}' config injected")
+            # ── Registration retry loop ──
+            # We loop here: inject → reload → check registration
+            # If rejected, user can modify params and retry
+            max_retries = 10  # Safety limit
+            attempt = 0
 
-            # 3. Reload and check registration
-            print("\n[PROXY TEST 3/6] Reloading Asterisk and checking registration...")
-            # Reload dialplan too since we modified extensions_custom.conf
-            self.reload_asterisk(dialplan=True)
-            
-            registered, detail = self.check_registration(timeout=20)
-            results["registration"] = registered
-            results["registration_detail"] = detail
-            
-            if registered:
-                print("OK - Trunk registered through proxy!")
-            else:
-                print(f"ERRORE: Registration failed ({detail})")
+            while attempt < max_retries:
+                attempt += 1
+
+                # 2. Inject config
+                step2_label = "[PROXY TEST 2/6]" if attempt == 1 else f"[RETRY {attempt}]"
+                print(f"\n{step2_label} Injecting temporary trunk config...")
+                if not self.inject_trunk(
+                    registrar, sip_port, trunk_number, auth_id, auth_pass,
+                    trunk_name, outbound_proxy, transport_name=transport_name,
+                    from_domain=from_domain, client_uri=client_uri, server_uri=server_uri
+                ):
+                    print("ERRORE: Failed to write config files.")
+                    results["diagnostics"].append("Config injection failed")
+                    return results
+                results["inject"] = True
+                print(f"OK - Trunk '{self.trunk_name}' config injected")
+
+                # 3. Reload and check registration
+                step3_label = "[PROXY TEST 3/6]" if attempt == 1 else f"[RETRY {attempt}]"
+                print(f"\n{step3_label} Reloading Asterisk and checking registration...")
+                self.reload_asterisk(dialplan=True)
+                
+                registered, detail = self.check_registration(timeout=20)
+                results["registration"] = registered
+                results["registration_detail"] = detail
+                
+                if registered:
+                    print("OK - Trunk registered through proxy!")
+                    break  # Exit retry loop — proceed to call tests
+                
+                # ── Registration failed ──
+                print(f"\n❌ Registration FAILED ({detail})")
+                
+                # Get detailed error from provider
+                error_detail = self.get_registration_error()
+                print(f"\n  [PROVIDER ERROR DETAIL]")
+                print(f"  {error_detail}")
+                
                 if detail == "Rejected":
                     results["diagnostics"].append("Provider rejected credentials through proxy")
                     results["diagnostics"].append("Check: auth_id, password, provider IP whitelist")
@@ -493,6 +559,72 @@ exten => {trunk_number},1,Answer()
                     results["diagnostics"].append("Check: firewall rules on proxy")
                     results["diagnostics"].append("Check: Kamailio routing to provider domain")
 
+                # Ask user if they want to retry with different params
+                print("\n  Current configuration:")
+                print(f"    Registrar:      {registrar}")
+                print(f"    Auth ID:        {auth_id}")
+                print(f"    Outbound Proxy: {outbound_proxy or '(none)'}")
+                print(f"    From Domain:    {from_domain or registrar}")
+                print(f"    Server URI:     {server_uri or f'sip:{registrar}:{sip_port}'}")
+                print(f"    Client URI:     {client_uri or f'sip:{auth_id}@{registrar}:{sip_port}'}")
+
+                if not ask_yes_no("\nDo you want to modify the data and retry? [y/N]"):
+                    print("  Registration test aborted by user.")
+                    # Cleanup and return — do NOT continue to inbound/outbound tests
+                    return results
+
+                # ── User wants to retry: ask for new values ──
+                # Cleanup config files first (without reload)
+                self._cleanup_config_only()
+
+                print("\n  [MODIFY DATA] Press Enter to keep the current value:")
+                
+                new_registrar = get_input(f"  Registrar [{registrar}]")
+                if new_registrar.strip():
+                    registrar = new_registrar.strip()
+
+                new_port = get_input(f"  SIP Port [{sip_port}]")
+                if new_port.strip():
+                    try:
+                        sip_port = int(new_port.strip())
+                    except ValueError:
+                        print("    Invalid port, keeping current value.")
+
+                new_auth_id = get_input(f"  Auth ID [{auth_id}]")
+                if new_auth_id.strip():
+                    auth_id = new_auth_id.strip()
+
+                import getpass
+                new_pass = getpass.getpass(f"  Password [****]: ")
+                if new_pass.strip():
+                    auth_pass = new_pass.strip()
+
+                new_proxy = get_input(f"  Outbound Proxy [{outbound_proxy or '(none)'}]")
+                if new_proxy.strip():
+                    outbound_proxy = new_proxy.strip()
+
+                new_from_domain = get_input(f"  From Domain [{from_domain or registrar}]")
+                if new_from_domain.strip():
+                    from_domain = new_from_domain.strip()
+
+                new_server_uri = get_input(f"  Server URI [{server_uri or f'sip:{registrar}:{sip_port}'}]")
+                if new_server_uri.strip():
+                    server_uri = new_server_uri.strip()
+
+                new_client_uri = get_input(f"  Client URI [{client_uri or f'sip:{auth_id}@{registrar}:{sip_port}'}]")
+                if new_client_uri.strip():
+                    client_uri = new_client_uri.strip()
+
+                print(f"\n  Retrying with updated configuration...")
+                # Loop continues: inject → reload → check again
+
+            else:
+                # max_retries exceeded
+                print(f"\n❌ Maximum retry attempts ({max_retries}) reached. Aborting.")
+                return results
+
+            # ── Registration succeeded — continue with tests ──
+
             # 4. Endpoint diagnostics
             print("\n[PROXY TEST 4/6] Checking endpoint details...")
             endpoint_info = self.check_endpoint()
@@ -501,7 +633,6 @@ exten => {trunk_number},1,Answer()
 
             # 5. Inbound test
             print("\n[PROXY TEST 5/6] Inbound Call Test")
-            from main import ask_yes_no
             if ask_yes_no("Do you want to test an INBOUND call? Call the trunk number now [y/N]"):
                 print(f"Waiting for inbound call to {trunk_number} (60s timeout)...")
                 if self.wait_for_inbound(timeout=60):
