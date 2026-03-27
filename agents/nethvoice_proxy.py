@@ -3,6 +3,8 @@ NethVoice Proxy Test Mode
 Temporarily injects pjsip trunk config into FreePBX/Asterisk,
 tests through the real Kamailio proxy, and cleans up after.
 """
+import base64
+import signal
 import subprocess
 import time
 import re
@@ -257,9 +259,9 @@ class NethVoiceProxyTester:
         self.config_files = files_to_write
 
         for filepath, content in files_to_write.items():
-            # Append to file (don't overwrite existing custom config)
-            escaped = content.replace('"', '\\"').replace("'", "'\\''")
-            cmd = f"echo '{escaped}' >> {filepath}"
+            # Encode content as base64 to avoid all shell quoting/newline issues
+            b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
+            cmd = f"echo {b64} | base64 -d >> {filepath}"
             out, err, code = self._exec(cmd)
             if code != 0:
                 self.logger.error(f"Failed to write {filepath}: {err}")
@@ -484,20 +486,24 @@ class NethVoiceProxyTester:
     def cleanup(self):
         """Remove temporary config and reload."""
         self.logger.info("Cleaning up temporary trunk config...")
-        
+
         for filepath in self.config_files:
-            # Delete everything between START and END markers (inclusive)
-            cmd = f"sed -i '/=== TrunkChecker START ===/,/=== TrunkChecker END ===/d' {filepath}"
-            self._exec(cmd)
-            # Also remove any remaining lines with our trunk name (safety net)
-            cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
-            self._exec(cmd)
-            # Remove trunkchk context lines from extensions_custom.conf
-            if "extensions_custom" in filepath:
-                self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
-                self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
-                self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
-            self.logger.info(f"Cleaned {filepath}")
+            try:
+                # Delete everything between START and END markers (inclusive)
+                cmd = f"sed -i '/=== TrunkChecker START ===/,/=== TrunkChecker END ===/d' {filepath}"
+                self._exec(cmd)
+                # Safety net: remove any remaining lines with our trunk name
+                if self.trunk_name:
+                    cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
+                    self._exec(cmd)
+                # Remove trunkchk context lines from extensions_custom.conf
+                if "extensions_custom" in filepath:
+                    self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
+                    self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
+                    self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
+                self.logger.info(f"Cleaned {filepath}")
+            except Exception as e:
+                self.logger.error(f"Error cleaning {filepath}: {e}")
 
         self.reload_asterisk(dialplan=True)
         self.logger.info("Cleanup complete")
@@ -508,8 +514,9 @@ class NethVoiceProxyTester:
         for filepath in self.config_files:
             cmd = f"sed -i '/=== TrunkChecker START ===/,/=== TrunkChecker END ===/d' {filepath}"
             self._exec(cmd)
-            cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
-            self._exec(cmd)
+            if self.trunk_name:
+                cmd = f"sed -i '/{self.trunk_name}/d' {filepath}"
+                self._exec(cmd)
             if "extensions_custom" in filepath:
                 self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
                 self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
@@ -810,10 +817,24 @@ class NethVoiceProxyTester:
                         results["diagnostics"].append("Check: codec compatibility")
 
         finally:
-            # ALWAYS cleanup
+            # ALWAYS cleanup — suppress SIGINT so double Ctrl+C cannot abort this
             print("\n[CLEANUP] Removing temporary trunk config...")
-            self.cleanup()
-            print("OK - Temporary config removed")
+            try:
+                old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            except (OSError, ValueError):
+                old_sigint = None
+            try:
+                self.cleanup()
+                print("OK - Temporary config removed")
+            except Exception as e:
+                self.logger.error(f"Cleanup failed: {e}")
+                print(f"WARNING: Cleanup may be incomplete. Check config files manually.")
+            finally:
+                if old_sigint is not None:
+                    try:
+                        signal.signal(signal.SIGINT, old_sigint)
+                    except (OSError, ValueError):
+                        pass
 
         # Print summary
         print("\n" + "=" * 60)
