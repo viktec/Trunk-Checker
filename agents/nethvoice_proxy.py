@@ -585,40 +585,64 @@ class NethVoiceProxyTester:
 
         return []
 
-    def _detect_freepbx_destination(self, proxy_module):
-        """Detect the SIP URI Kamailio should use to forward calls to this FreePBX."""
+    def _detect_freepbx_destination(self, proxy_module, outbound_proxy=None):
+        """Detect the SIP URI Kamailio should use to forward calls to this FreePBX.
+
+        Strategy:
+        1. Read existing Kamailio trunk routes and copy the destination pattern
+        2. Use `podman port` to find the host-mapped SIP port, combined with the
+           proxy host IP (extracted from outbound_proxy) — mirrors the typical
+           NethVoice pattern: sip:<proxy_ip>:<mapped_port>
+        3. Fall back to container network IP + port 5060
+        """
         import json as _json
 
-        # Method 1: read existing routes and copy the destination pattern
-        out, _, code = self._exec_host(f"api-cli run module/{proxy_module}/list-trunks 2>/dev/null", timeout=10)
-        if code == 0 and out.strip():
-            try:
-                data = _json.loads(out)
-                if isinstance(data, list):
-                    for entry in data:
-                        uri = entry.get('destination', {}).get('uri', '')
-                        if uri.startswith('sip:'):
-                            self.logger.info(f"Destination from existing routes: {uri}")
-                            return uri
-            except Exception:
-                pass
+        # Extract proxy host IP from outbound_proxy (e.g. "sip:10.5.4.1:5060;lr" → "10.5.4.1")
+        proxy_ip = None
+        if outbound_proxy:
+            m = re.search(r'sip:([^:;/\s]+)', outbound_proxy)
+            if m:
+                proxy_ip = m.group(1)
 
-        # Method 2: detect FreePBX container IP + Asterisk SIP port
-        ip_out, _, _ = self._exec_host(
-            f"podman inspect {self.container} --format '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}}{{{{end}}}}' 2>/dev/null"
-        )
-        if ip_out.strip():
-            # Get Asterisk PJSIP UDP port from inside the container
-            t_out, _, t_code = self._exec(
-                "asterisk -rx 'pjsip show transports' 2>/dev/null | grep -i udp | head -1"
+        # Method 1: read existing routes from Kamailio and copy destination
+        for cmd_variant in ["list-trunks", "get-trunks"]:
+            out, _, code = self._exec_host(
+                f"api-cli run module/{proxy_module}/{cmd_variant} 2>/dev/null", timeout=10
             )
-            port = "5060"
-            if t_code == 0 and t_out:
-                m = re.search(r':(\d+)', t_out)
-                if m:
-                    port = m.group(1)
-            dest = f"sip:{ip_out.strip()}:{port}"
-            self.logger.info(f"Detected FreePBX destination: {dest}")
+            if code == 0 and out.strip():
+                try:
+                    data = _json.loads(out)
+                    if isinstance(data, list):
+                        for entry in data:
+                            uri = entry.get('destination', {}).get('uri', '')
+                            if uri.startswith('sip:'):
+                                self.logger.info(f"Destination from existing routes: {uri}")
+                                return uri
+                except Exception:
+                    pass
+
+        # Method 2: podman port mapping — most reliable for rootless NethVoice containers
+        # FreePBX SIP port 5060/udp is mapped to a host port; Kamailio reaches it via proxy_ip:host_port
+        port_out, _, port_code = self._exec_host(
+            f"podman port {self.container} 5060/udp 2>/dev/null"
+        )
+        if port_code == 0 and port_out.strip():
+            # Output format: "0.0.0.0:20035" or "127.0.0.1:20035"
+            pm = re.search(r':(\d+)$', port_out.strip())
+            if pm:
+                host_port = pm.group(1)
+                if proxy_ip:
+                    dest = f"sip:{proxy_ip}:{host_port}"
+                    self.logger.info(f"Detected FreePBX destination via port mapping: {dest}")
+                    return dest
+
+        # Method 3: container network IP (works for non-rootless or bridge networks)
+        ip_out, _, ip_code = self._exec_host(
+            f"podman inspect {self.container} --format '{{{{.NetworkSettings.IPAddress}}}}' 2>/dev/null"
+        )
+        if ip_code == 0 and ip_out.strip():
+            dest = f"sip:{ip_out.strip()}:5060"
+            self.logger.info(f"Detected FreePBX destination via container IP: {dest}")
             return dest
 
         return None
@@ -939,7 +963,7 @@ class NethVoiceProxyTester:
                     print(f"  Using: {selected_module}")
 
                 # Detect destination URI for Kamailio
-                detected_dest = self._detect_freepbx_destination(selected_module)
+                detected_dest = self._detect_freepbx_destination(selected_module, outbound_proxy)
                 if detected_dest:
                     print(f"  INFO: Auto-detected FreePBX destination: {detected_dest}")
                 dest_input = get_input(f"  FreePBX destination URI [{detected_dest or 'e.g. sip:10.5.4.2:5060'}]")
