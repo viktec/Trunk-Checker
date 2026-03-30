@@ -527,16 +527,20 @@ class NethVoiceProxyTester:
 
         # Remove Kamailio route if we added one
         if self.kamailio_module and self.kamailio_rule:
+            import json as _json
+            remove_cmd = (
+                f"api-cli run module/{self.kamailio_module}/remove-trunk "
+                f"-d '{_json.dumps({\"rule\": self.kamailio_rule})}'"
+            )
             self.logger.info(f"Removing Kamailio route for {self.kamailio_rule}...")
             if self.remove_kamailio_route(self.kamailio_module, self.kamailio_rule):
                 self.logger.info("Kamailio route removed")
                 self.kamailio_rule = None
             else:
-                self.logger.error(
-                    f"Could not remove Kamailio route automatically. "
-                    f"Remove manually: api-cli run module/{self.kamailio_module}/remove-trunk "
-                    f"-d '{{\"rule\":\"{self.kamailio_rule}\"}}'"
-                )
+                print(f"\n  WARNING: Could not remove Kamailio route automatically.")
+                print(f"  Run this command AS ROOT to clean up:")
+                print(f"\n    {remove_cmd}\n")
+                self.logger.error(f"Manual remove needed: {remove_cmd}")
 
         self.logger.info("Cleanup complete")
 
@@ -1014,6 +1018,15 @@ class NethVoiceProxyTester:
                     desc_input = get_input(f"  Description (FreePBX instance name) [{self.container}]")
                     description = desc_input.strip() if desc_input.strip() else self.container
 
+                    import json as _json
+                    add_payload = _json.dumps({
+                        "rule": did_rule,
+                        "destination": {"uri": destination_uri, "description": description}
+                    })
+                    remove_payload = _json.dumps({"rule": did_rule})
+                    add_cmd    = f"api-cli run module/{selected_module}/add-trunk -d '{add_payload}'"
+                    remove_cmd = f"api-cli run module/{selected_module}/remove-trunk -d '{remove_payload}'"
+
                     print(f"  Adding Kamailio route: {did_rule} → {destination_uri} ...")
                     if self.add_kamailio_route(selected_module, did_rule, destination_uri, description):
                         self.kamailio_module = selected_module
@@ -1021,9 +1034,20 @@ class NethVoiceProxyTester:
                         results["kamailio_route"] = True
                         kamailio_route_ok = True
                         print(f"OK - Kamailio route added ({selected_module}: {did_rule})")
+                        print(f"  (Will be removed automatically on cleanup)")
+                        print(f"  Manual remove command (if needed):")
+                        print(f"    {remove_cmd}")
                     else:
                         results["kamailio_route"] = False
-                        print("WARNING: Could not add Kamailio route — inbound test may fail.")
+                        print("\n  WARNING: Could not add Kamailio route automatically (api-cli requires root).")
+                        print(f"  Run this command AS ROOT in another terminal, then press Enter:")
+                        print(f"\n    {add_cmd}\n")
+                        input("  Press Enter when done (or just Enter to skip and continue)...")
+                        # Store for cleanup so we can print the remove command at the end
+                        self.kamailio_module = selected_module
+                        self.kamailio_rule = did_rule
+                        kamailio_route_ok = True  # User confirmed they ran it manually
+                        results["kamailio_route"] = "manual"
                 else:
                     print("  WARNING: No destination URI — skipping Kamailio route.")
                     results["kamailio_route"] = None
@@ -1095,6 +1119,8 @@ class NethVoiceProxyTester:
         kr = results.get("kamailio_route")
         if kr is True:
             print(f"  Kamailio Route:      OK (added & removed on cleanup)")
+        elif kr == "manual":
+            print(f"  Kamailio Route:      MANUAL (added by user, remove manually)")
         elif kr is False:
             print(f"  Kamailio Route:      FAIL (could not add)")
         if results["inbound"] is not None:
