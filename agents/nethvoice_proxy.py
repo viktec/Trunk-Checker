@@ -24,6 +24,8 @@ class NethVoiceProxyTester:
         self.trunk_name = None
         self.config_files = {}  # Track files we write to for cleanup
         self._secrets = []  # Passwords to mask in logs
+        self.kamailio_module = None   # Proxy module used (e.g. "nethvoice-proxy1")
+        self.kamailio_rule = None     # DID rule added to Kamailio (for cleanup)
 
     def _mask(self, text):
         """Mask any secrets in text before logging."""
@@ -441,11 +443,17 @@ class NethVoiceProxyTester:
         except KeyboardInterrupt:
             print("\n  Outbound test interrupted.")
         
-        if best_state:
+        if best_state and best_state != "Down (setup)":
             print(f"\n  Call reached state: {best_state}")
             self.logger.info(f"Best call state seen: {best_state}")
             return True
-        
+
+        if best_state == "Down (setup)":
+            print(f"\n  Call reached state: {best_state}")
+            self.logger.info(f"Best call state seen: {best_state}")
+            self.logger.error("Outbound channel created but call never progressed (no Ringing/Up) — likely rejected by provider or proxy")
+            return False
+
         self.logger.error("No outbound channel detected")
         return False
 
@@ -499,13 +507,25 @@ class NethVoiceProxyTester:
                 # Remove trunkchk context lines from extensions_custom.conf
                 if "extensions_custom" in filepath:
                     self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
-                    self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
-                    self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
                 self.logger.info(f"Cleaned {filepath}")
             except Exception as e:
                 self.logger.error(f"Error cleaning {filepath}: {e}")
 
         self.reload_asterisk(dialplan=True)
+
+        # Remove Kamailio route if we added one
+        if self.kamailio_module and self.kamailio_rule:
+            self.logger.info(f"Removing Kamailio route for {self.kamailio_rule}...")
+            if self.remove_kamailio_route(self.kamailio_module, self.kamailio_rule):
+                self.logger.info("Kamailio route removed")
+                self.kamailio_rule = None
+            else:
+                self.logger.error(
+                    f"Could not remove Kamailio route automatically. "
+                    f"Remove manually: api-cli run module/{self.kamailio_module}/remove-trunk "
+                    f"-d '{{\"rule\":\"{self.kamailio_rule}\"}}'"
+                )
+
         self.logger.info("Cleanup complete")
 
     def _cleanup_config_only(self):
@@ -519,8 +539,118 @@ class NethVoiceProxyTester:
                 self._exec(cmd)
             if "extensions_custom" in filepath:
                 self._exec(f"sed -i '/trunkchk-inbound-test/d' {filepath}")
-                self._exec(f"sed -i '/same => n,Wait/d' {filepath}")
-                self._exec(f"sed -i '/same => n,Hangup/d' {filepath}")
+
+    # ── Kamailio route management ──────────────────────────────────────────────
+
+    def _exec_host(self, cmd, timeout=10):
+        """Execute command on the host (not inside the FreePBX container)."""
+        self.logger.info(f"EXEC_HOST: {self._mask(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            if result.returncode != 0:
+                self.logger.error(f"Host command failed: {result.stderr.strip()}")
+            return result.stdout.strip(), result.stderr.strip(), result.returncode
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Host command timed out: {cmd}")
+            return "", "timeout", 1
+        except Exception as e:
+            self.logger.error(f"Host exec error: {e}")
+            return "", str(e), 1
+
+    def detect_kamailio_proxy_modules(self):
+        """Return list of available NethVoice proxy module names on this host."""
+        self.logger.info("Detecting NethVoice proxy modules...")
+
+        # Method 1: home directories for nethvoice-proxy* module users
+        out, _, code = self._exec_host("ls /home/ 2>/dev/null | grep -E '^nethvoice-proxy[0-9]*$'")
+        if code == 0 and out.strip():
+            modules = [m.strip() for m in out.strip().split('\n') if m.strip()]
+            self.logger.info(f"Found proxy modules (home dirs): {modules}")
+            return modules
+
+        # Method 2: running podman containers with nethvoice-proxy in the name
+        out, _, code = self._exec_host("podman ps --format '{{.Names}}' 2>/dev/null | grep -i 'nethvoice-proxy'")
+        if code == 0 and out.strip():
+            modules = set()
+            for line in out.strip().split('\n'):
+                m = re.match(r'(nethvoice-proxy\d+)', line)
+                if m:
+                    modules.add(m.group(1))
+            if modules:
+                result = sorted(list(modules))
+                self.logger.info(f"Found proxy modules (containers): {result}")
+                return result
+
+        return []
+
+    def _detect_freepbx_destination(self, proxy_module):
+        """Detect the SIP URI Kamailio should use to forward calls to this FreePBX."""
+        import json as _json
+
+        # Method 1: read existing routes and copy the destination pattern
+        out, _, code = self._exec_host(f"api-cli run module/{proxy_module}/list-trunks 2>/dev/null", timeout=10)
+        if code == 0 and out.strip():
+            try:
+                data = _json.loads(out)
+                if isinstance(data, list):
+                    for entry in data:
+                        uri = entry.get('destination', {}).get('uri', '')
+                        if uri.startswith('sip:'):
+                            self.logger.info(f"Destination from existing routes: {uri}")
+                            return uri
+            except Exception:
+                pass
+
+        # Method 2: detect FreePBX container IP + Asterisk SIP port
+        ip_out, _, _ = self._exec_host(
+            f"podman inspect {self.container} --format '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}}{{{{end}}}}' 2>/dev/null"
+        )
+        if ip_out.strip():
+            # Get Asterisk PJSIP UDP port from inside the container
+            t_out, _, t_code = self._exec(
+                "asterisk -rx 'pjsip show transports' 2>/dev/null | grep -i udp | head -1"
+            )
+            port = "5060"
+            if t_code == 0 and t_out:
+                m = re.search(r':(\d+)', t_out)
+                if m:
+                    port = m.group(1)
+            dest = f"sip:{ip_out.strip()}:{port}"
+            self.logger.info(f"Detected FreePBX destination: {dest}")
+            return dest
+
+        return None
+
+    def add_kamailio_route(self, proxy_module, did_rule, destination_uri, description="trunkchecker"):
+        """Add a DID routing rule to Kamailio via api-cli."""
+        import json as _json
+        payload = _json.dumps({
+            "rule": did_rule,
+            "destination": {"uri": destination_uri, "description": description}
+        })
+        cmd = f"api-cli run module/{proxy_module}/add-trunk -d '{payload}'"
+        self.logger.info(f"Adding Kamailio route: rule={did_rule} dest={destination_uri}")
+        out, err, code = self._exec_host(cmd, timeout=15)
+        if code == 0:
+            self.logger.info(f"Kamailio route added OK: {out}")
+            return True
+        self.logger.error(f"Failed to add Kamailio route: {err or out}")
+        return False
+
+    def remove_kamailio_route(self, proxy_module, did_rule):
+        """Remove a DID routing rule from Kamailio via api-cli."""
+        import json as _json
+        payload = _json.dumps({"rule": did_rule})
+        cmd = f"api-cli run module/{proxy_module}/remove-trunk -d '{payload}'"
+        self.logger.info(f"Removing Kamailio route: rule={did_rule}")
+        out, err, code = self._exec_host(cmd, timeout=15)
+        if code == 0:
+            self.logger.info(f"Kamailio route removed OK: {out}")
+            return True
+        self.logger.error(f"Failed to remove Kamailio route: {err or out}")
+        return False
 
     def _print_rejection_diagnostics(self, error_detail, registrar, auth_id, outbound_proxy):
         """Print detailed troubleshooting guide for rejected registrations."""
@@ -606,6 +736,7 @@ class NethVoiceProxyTester:
             "inject": False,
             "registration": False,
             "registration_detail": "",
+            "kamailio_route": None,
             "inbound": None,
             "outbound": None,
             "outbound_proxy": None,
@@ -786,6 +917,63 @@ class NethVoiceProxyTester:
             if endpoint_info:
                 print("OK - Endpoint configured")
 
+            # 4.5 Kamailio inbound route
+            print("\n[PROXY TEST 4.5/6] Kamailio Inbound Route")
+            kamailio_route_ok = False
+            proxy_modules = self.detect_kamailio_proxy_modules()
+            if proxy_modules:
+                # Select proxy module
+                if len(proxy_modules) == 1:
+                    selected_module = proxy_modules[0]
+                    print(f"  INFO: Auto-detected proxy module: {selected_module}")
+                else:
+                    print("  Available proxy modules:")
+                    for i, m in enumerate(proxy_modules, 1):
+                        print(f"    {i}) {m}")
+                    choice = get_input(f"  Select module [1-{len(proxy_modules)}, default: 1]")
+                    try:
+                        idx = int(choice.strip()) - 1 if choice.strip() else 0
+                        selected_module = proxy_modules[max(0, min(idx, len(proxy_modules) - 1))]
+                    except ValueError:
+                        selected_module = proxy_modules[0]
+                    print(f"  Using: {selected_module}")
+
+                # Detect destination URI for Kamailio
+                detected_dest = self._detect_freepbx_destination(selected_module)
+                if detected_dest:
+                    print(f"  INFO: Auto-detected FreePBX destination: {detected_dest}")
+                dest_input = get_input(f"  FreePBX destination URI [{detected_dest or 'e.g. sip:10.5.4.2:5060'}]")
+                destination_uri = dest_input.strip() if dest_input.strip() else detected_dest
+
+                if destination_uri:
+                    # Ask for the DID rule (number format the provider sends)
+                    print(f"  INFO: The rule must match the format the provider sends the number in.")
+                    print(f"        e.g. national: {trunk_number}  or E.164: +39{trunk_number.lstrip('0')}")
+                    rule_input = get_input(f"  DID rule [{trunk_number}]")
+                    did_rule = rule_input.strip() if rule_input.strip() else trunk_number
+
+                    # Ask for the description (FreePBX instance name)
+                    desc_input = get_input(f"  Description (FreePBX instance name) [{self.container}]")
+                    description = desc_input.strip() if desc_input.strip() else self.container
+
+                    print(f"  Adding Kamailio route: {did_rule} → {destination_uri} ...")
+                    if self.add_kamailio_route(selected_module, did_rule, destination_uri, description):
+                        self.kamailio_module = selected_module
+                        self.kamailio_rule = did_rule
+                        results["kamailio_route"] = True
+                        kamailio_route_ok = True
+                        print(f"OK - Kamailio route added ({selected_module}: {did_rule})")
+                    else:
+                        results["kamailio_route"] = False
+                        print("WARNING: Could not add Kamailio route — inbound test may fail.")
+                else:
+                    print("  WARNING: No destination URI — skipping Kamailio route.")
+                    results["kamailio_route"] = None
+            else:
+                print("  INFO: No NethVoice proxy modules detected on this host — skipping Kamailio route.")
+                print("        (If running remotely, add the route manually before the inbound test)")
+                results["kamailio_route"] = None
+
             # 5. Inbound test
             print("\n[PROXY TEST 5/6] Inbound Call Test")
             if ask_yes_no("Do you want to test an INBOUND call? Call the trunk number now [y/N]"):
@@ -797,9 +985,10 @@ class NethVoiceProxyTester:
                     print("ERRORE: No inbound call detected.")
                     results["inbound"] = False
                     results["diagnostics"].append("Inbound call not received through proxy")
-                    results["diagnostics"].append("Check: provider inbound routing")
+                    results["diagnostics"].append("Check: provider inbound routing to this DID")
                     results["diagnostics"].append("Check: NethVoice Inbound Route (DID mapping) for this number")
-                    results["diagnostics"].append("Check: Kamailio identify/match for this trunk")
+                    if not kamailio_route_ok:
+                        results["diagnostics"].append("Check: Kamailio route was NOT added — add it manually")
 
             # 6. Outbound test
             if destination_number:
@@ -812,9 +1001,11 @@ class NethVoiceProxyTester:
                     else:
                         print("ERRORE: Outbound call failed.")
                         results["outbound"] = False
-                        results["diagnostics"].append("Outbound call failed through proxy")
-                        results["diagnostics"].append("Check: provider allows outbound from this trunk")
+                        results["diagnostics"].append("Outbound call failed through proxy (channel stayed Down — no Ringing/Up)")
+                        results["diagnostics"].append("Check: provider allows outbound from this trunk/username")
+                        results["diagnostics"].append("Check: outbound caller ID accepted by provider")
                         results["diagnostics"].append("Check: codec compatibility")
+                        results["diagnostics"].append("Check: Asterisk log for SIP error code (403/486/503...)")
 
         finally:
             # ALWAYS cleanup — suppress SIGINT so double Ctrl+C cannot abort this
@@ -843,6 +1034,11 @@ class NethVoiceProxyTester:
         print(f"  Container Access:    {'OK' if results['access'] else 'FAIL'}")
         print(f"  Config Injection:    {'OK' if results['inject'] else 'FAIL'}")
         print(f"  Registration:        {'OK' if results['registration'] else 'FAIL'} ({results['registration_detail']})")
+        kr = results.get("kamailio_route")
+        if kr is True:
+            print(f"  Kamailio Route:      OK (added & removed on cleanup)")
+        elif kr is False:
+            print(f"  Kamailio Route:      FAIL (could not add)")
         if results["inbound"] is not None:
             print(f"  Inbound Call:        {'OK' if results['inbound'] else 'FAIL'}")
         if results["outbound"] is not None:
