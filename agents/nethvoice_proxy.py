@@ -26,6 +26,7 @@ class NethVoiceProxyTester:
         self._secrets = []  # Passwords to mask in logs
         self.kamailio_module = None   # Proxy module used (e.g. "nethvoice-proxy1")
         self.kamailio_rule = None     # DID rule added to Kamailio (for cleanup)
+        self._asterisk_sip_port = None  # Asterisk SIP port (detected from pjsip transports)
 
     def _mask(self, text):
         """Mask any secrets in text before logging."""
@@ -63,11 +64,15 @@ class NethVoiceProxyTester:
             return False
 
     def detect_transport(self):
-        """Auto-detect the UDP transport name from Asterisk."""
+        """Auto-detect the UDP transport name from Asterisk.
+
+        Also stores the SIP port in self._asterisk_sip_port for later use
+        (important when the container uses host networking).
+        """
         self.logger.info("Detecting PJSIP UDP transport...")
         cmd = "asterisk -rx 'pjsip show transports'"
         out, err, code = self._exec(cmd)
-        
+
         if code != 0:
             self.logger.error("Failed to list transports")
             return "0.0.0.0-udp"
@@ -80,8 +85,15 @@ class NethVoiceProxyTester:
                 if len(parts) >= 3 and parts[2] == "udp":
                     t_name = parts[1]
                     self.logger.info(f"Auto-detected UDP Transport: {t_name}")
+                    # Extract the SIP port from the BindAddress column (last field)
+                    # Format: "Transport: 0.0.0.0-udp  udp  0  0  0.0.0.0:PORT"
+                    bind_addr = parts[-1] if parts else ""
+                    port_m = re.search(r':(\d+)$', bind_addr)
+                    if port_m:
+                        self._asterisk_sip_port = port_m.group(1)
+                        self.logger.info(f"Asterisk SIP port: {self._asterisk_sip_port}")
                     return t_name
-                    
+
         self.logger.warning("No explicit UDP transport found, using fallback '0.0.0.0-udp'")
         return "0.0.0.0-udp"
 
@@ -559,6 +571,14 @@ class NethVoiceProxyTester:
             self.logger.error(f"Host exec error: {e}")
             return "", str(e), 1
 
+    def _exec_api_cli(self, api_cmd, timeout=15):
+        """Run an api-cli command on the host, trying sudo if direct access is denied."""
+        out, err, code = self._exec_host(f"api-cli {api_cmd} 2>/dev/null", timeout=timeout)
+        if code != 0:
+            self.logger.info("api-cli failed without sudo — retrying with sudo")
+            out, err, code = self._exec_host(f"sudo api-cli {api_cmd} 2>/dev/null", timeout=timeout)
+        return out, err, code
+
     def detect_kamailio_proxy_modules(self):
         """Return list of available NethVoice proxy module names on this host."""
         self.logger.info("Detecting NethVoice proxy modules...")
@@ -604,59 +624,72 @@ class NethVoiceProxyTester:
             if m:
                 proxy_ip = m.group(1)
 
-        # Method 1: read existing routes from Kamailio and copy destination
+        # Method 1: Asterisk SIP port from pjsip show transports (most reliable with host networking)
+        # With host networking the container port IS the host port — combine with proxy_ip.
+        if self._asterisk_sip_port and proxy_ip:
+            dest = f"sip:{proxy_ip}:{self._asterisk_sip_port}"
+            self.logger.info(f"Detected FreePBX destination via Asterisk transport port: {dest}")
+            return dest
+
+        # Method 2: read existing routes from Kamailio via api-cli (requires root/sudo)
         for cmd_variant in ["list-trunks", "get-trunks"]:
-            out, _, code = self._exec_host(
-                f"api-cli run module/{proxy_module}/{cmd_variant} 2>/dev/null", timeout=10
+            out, _, code = self._exec_api_cli(
+                f"run module/{proxy_module}/{cmd_variant}", timeout=10
             )
             if code == 0 and out.strip():
                 try:
                     data = _json.loads(out)
-                    if isinstance(data, list):
-                        for entry in data:
-                            uri = entry.get('destination', {}).get('uri', '')
-                            if uri.startswith('sip:'):
-                                self.logger.info(f"Destination from existing routes: {uri}")
-                                return uri
+                    if isinstance(data, list) and data:
+                        # Use the first entry's URI as a pattern (same host, different port)
+                        uri = data[0].get('destination', {}).get('uri', '')
+                        if uri.startswith('sip:'):
+                            self.logger.info(f"Destination pattern from existing routes: {uri}")
+                            # Return with the actual Asterisk port if available, else the first route's port
+                            if self._asterisk_sip_port and proxy_ip:
+                                return f"sip:{proxy_ip}:{self._asterisk_sip_port}"
+                            return uri
                 except Exception:
                     pass
 
-        # Method 2: podman port mapping — most reliable for rootless NethVoice containers
-        # FreePBX SIP port 5060/udp is mapped to a host port; Kamailio reaches it via proxy_ip:host_port
+        # Method 3: podman port mapping (for containers with explicit -p port bindings)
         port_out, _, port_code = self._exec_host(
             f"podman port {self.container} 5060/udp 2>/dev/null"
         )
         if port_code == 0 and port_out.strip():
-            # Output format: "0.0.0.0:20035" or "127.0.0.1:20035"
             pm = re.search(r':(\d+)$', port_out.strip())
-            if pm:
-                host_port = pm.group(1)
-                if proxy_ip:
-                    dest = f"sip:{proxy_ip}:{host_port}"
-                    self.logger.info(f"Detected FreePBX destination via port mapping: {dest}")
-                    return dest
+            if pm and proxy_ip:
+                dest = f"sip:{proxy_ip}:{pm.group(1)}"
+                self.logger.info(f"Detected FreePBX destination via port mapping: {dest}")
+                return dest
 
-        # Method 3: container network IP (works for non-rootless or bridge networks)
+        # Method 4: container network IP via Python JSON (Netavark/CNI networks)
         ip_out, _, ip_code = self._exec_host(
-            f"podman inspect {self.container} --format '{{{{.NetworkSettings.IPAddress}}}}' 2>/dev/null"
+            f"podman inspect {self.container} 2>/dev/null | "
+            "python3 -c \""
+            "import json,sys; d=json.load(sys.stdin); "
+            "nets=d[0].get('NetworkSettings',{}).get('Networks',{}).values(); "
+            "ips=[v.get('IPAddress','') for v in nets if v.get('IPAddress')]; "
+            "print(ips[0] if ips else '')"
+            "\""
         )
         if ip_code == 0 and ip_out.strip():
             dest = f"sip:{ip_out.strip()}:5060"
-            self.logger.info(f"Detected FreePBX destination via container IP: {dest}")
+            self.logger.info(f"Detected FreePBX destination via container network IP: {dest}")
             return dest
 
         return None
 
     def add_kamailio_route(self, proxy_module, did_rule, destination_uri, description="trunkchecker"):
-        """Add a DID routing rule to Kamailio via api-cli."""
+        """Add a DID routing rule to Kamailio via api-cli (with sudo fallback)."""
         import json as _json
         payload = _json.dumps({
             "rule": did_rule,
             "destination": {"uri": destination_uri, "description": description}
         })
-        cmd = f"api-cli run module/{proxy_module}/add-trunk -d '{payload}'"
         self.logger.info(f"Adding Kamailio route: rule={did_rule} dest={destination_uri}")
-        out, err, code = self._exec_host(cmd, timeout=15)
+        out, err, code = self._exec_api_cli(
+            f"run module/{proxy_module}/add-trunk -d '{payload}'"
+        )
         if code == 0:
             self.logger.info(f"Kamailio route added OK: {out}")
             return True
@@ -664,12 +697,13 @@ class NethVoiceProxyTester:
         return False
 
     def remove_kamailio_route(self, proxy_module, did_rule):
-        """Remove a DID routing rule from Kamailio via api-cli."""
+        """Remove a DID routing rule from Kamailio via api-cli (with sudo fallback)."""
         import json as _json
         payload = _json.dumps({"rule": did_rule})
-        cmd = f"api-cli run module/{proxy_module}/remove-trunk -d '{payload}'"
         self.logger.info(f"Removing Kamailio route: rule={did_rule}")
-        out, err, code = self._exec_host(cmd, timeout=15)
+        out, err, code = self._exec_api_cli(
+            f"run module/{proxy_module}/remove-trunk -d '{payload}'"
+        )
         if code == 0:
             self.logger.info(f"Kamailio route removed OK: {out}")
             return True
