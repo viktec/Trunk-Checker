@@ -577,11 +577,17 @@ class NethVoiceProxyTester:
             return "", str(e), 1
 
     def _exec_api_cli(self, api_cmd, timeout=15):
-        """Run an api-cli command on the host, trying sudo if direct access is denied."""
+        """Run an api-cli command on the host.
+
+        Tries direct api-cli first, then sudo -n (non-interactive, fails
+        immediately if a password is required — never blocks for input).
+        """
         out, err, code = self._exec_host(f"api-cli {api_cmd} 2>/dev/null", timeout=timeout)
         if code != 0:
-            self.logger.info("api-cli failed without sudo — retrying with sudo")
-            out, err, code = self._exec_host(f"sudo api-cli {api_cmd} 2>/dev/null", timeout=timeout)
+            self.logger.info("api-cli failed without sudo — retrying with sudo -n")
+            out, err, code = self._exec_host(
+                f"sudo -n api-cli {api_cmd} 2>/dev/null", timeout=timeout
+            )
         return out, err, code
 
     def detect_kamailio_proxy_modules(self):
