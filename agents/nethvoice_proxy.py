@@ -528,9 +528,10 @@ class NethVoiceProxyTester:
         # Remove Kamailio route if we added one
         if self.kamailio_module and self.kamailio_rule:
             import json as _json
+            _rule_payload = _json.dumps({"rule": self.kamailio_rule})
             remove_cmd = (
                 f"api-cli run module/{self.kamailio_module}/remove-trunk "
-                f"-d '{_json.dumps({\"rule\": self.kamailio_rule})}'"
+                f"-d '{_rule_payload}'"
             )
             self.logger.info(f"Removing Kamailio route for {self.kamailio_rule}...")
             if self.remove_kamailio_route(self.kamailio_module, self.kamailio_rule):
